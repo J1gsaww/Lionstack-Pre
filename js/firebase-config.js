@@ -65,7 +65,10 @@ function setStatus(state, text, onRetry){
 function clearStatus(){ const el = document.getElementById('fbStatus'); if(el) el.style.display = 'none'; }
 
 if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
-  // Local development: nothing to do, resolve so main.js proceeds.
+  // Local development: localStorage is synchronous and always ready, so the
+  // hydrate gate is open from the start and item collections just fall through
+  // to the normal whole-blob path (they only split per-record under Firestore).
+  window.__ssHydrated = true;
   window.__storeReady = Promise.resolve();
   window.__hydrateStore = async ()=>{};
 }else{
@@ -133,28 +136,111 @@ if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
     });
   }
 
+  const ITEM_COLLS = window.__ITEM_COLLECTIONS || new Set();
+
+  // Read one item collection (one document per record) back into a JSON array
+  // string, the same shape store.js caches for the whole-blob keys.
+  async function hydrateItemCollection(key){
+    const snap = await fsMod.getDocs(fsMod.collection(db, key));
+    const arr = [];
+    snap.forEach(d=>{
+      const raw = joinParts(d.data());
+      if(raw == null) return;
+      try{ arr.push(JSON.parse(raw)); }catch(e){ /* skip a corrupt record, keep the rest */ }
+    });
+    return JSON.stringify(arr);
+  }
+
+  // One-time move: an item collection still living as a legacy whole-blob
+  // document under appdata/<key> is exploded into one document per record.
+  // The legacy blob is copied aside to appdata_legacy/<key> (NOT deleted) so
+  // there's always a way back if anything looks wrong after the switch.
+  async function migrateLegacyBlob(key, legacyRaw){
+    let arr;
+    try{ arr = JSON.parse(legacyRaw); }catch(e){ return null; }
+    if(!Array.isArray(arr) || !arr.length) return null;
+    console.info('[firebase] migrating ' + arr.length + ' records of ' + key + ' to per-record docs');
+    // Back the blob up first, then write the per-record docs.
+    try{ await fsMod.setDoc(fsMod.doc(db, 'appdata_legacy', key), { v: legacyRaw, at: Date.now() }); }catch(e){}
+    for(const rec of arr){
+      if(!rec || rec.id == null) continue;
+      await writeItemDoc(key, rec.id, JSON.stringify(rec));
+    }
+    // Neutralise the old blob so a later boot doesn't migrate it again, but
+    // keep the backup copy above.
+    try{ await fsMod.deleteDoc(fsMod.doc(db, 'appdata', key)); }catch(e){}
+    return JSON.stringify(arr);
+  }
+
   window.__hydrateStore = async function(){
     try{
       if(!db) await ready;
       if(!db) return;
       if(!signedIn){ console.info('[firebase] not signed in yet — skipping hydrate'); return; }
+
+      // 1) whole-blob keys (config, stockpublic, base-app data) from appdata/*
       const snap = await fsMod.getDocs(fsMod.collection(db, 'appdata'));
       const next = {};
+      const legacyBlobs = {};
       snap.forEach(d=>{
         const raw = joinParts(d.data());
-        if(raw != null) next[d.id] = raw;
+        if(raw == null) return;
+        if(ITEM_COLLS.has(d.id)) legacyBlobs[d.id] = raw;  // an item collection not yet migrated
+        else next[d.id] = raw;
       });
+
+      // 2) item collections: read per-record docs, migrating any legacy blob first
+      for(const key of ITEM_COLLS){
+        let arrStr = await hydrateItemCollection(key);
+        let arr; try{ arr = JSON.parse(arrStr); }catch(e){ arr = []; }
+        if((!arr || !arr.length) && legacyBlobs[key]){
+          const migrated = await migrateLegacyBlob(key, legacyBlobs[key]);
+          if(migrated != null) arrStr = migrated;
+        }
+        next[key] = arrStr;
+      }
+
       // Replace in place — store.js holds a reference to this object.
       Object.keys(window.__ssCache).forEach(k=> delete window.__ssCache[k]);
       Object.assign(window.__ssCache, next);
-      console.info('[firebase] hydrated ' + Object.keys(next).length + ' keys');
+      // Re-base each device snapshot to what we just loaded, then open the gate.
+      if(typeof window.__rebuildItemSnaps === 'function') window.__rebuildItemSnaps();
+      window.__ssHydrated = true;
+      console.info('[firebase] hydrated ' + Object.keys(next).length + ' keys (item-aware)');
     }catch(e){
       console.error('[firebase] hydrate failed', e);
       setStatus('bad', 'อ่านข้อมูลจาก Firebase ไม่สำเร็จ — ลองรีเฟรช', ()=> location.reload());
     }
   };
 
+  // Write (or delete, when value===null) a SINGLE record document at
+  // <collectionKey>/<id>. Same chunking contract as writeOnce.
+  async function writeItemDoc(collKey, id, value){
+    const ref = fsMod.doc(db, collKey, String(id));
+    if(value === null){ await fsMod.deleteDoc(ref); return; }
+    if(value.length <= CHUNK){
+      await fsMod.setDoc(ref, { v: value, parts: 0, at: Date.now() });
+      return;
+    }
+    const payload = { parts: Math.ceil(value.length / CHUNK), v: '', at: Date.now() };
+    for(let i = 0; i < payload.parts; i++) payload['v' + i] = value.slice(i * CHUNK, (i + 1) * CHUNK);
+    await fsMod.setDoc(ref, payload);
+  }
+
+  // A per-record write is queued under a composite key so it rides the exact
+  // same debounce / retry / offline machinery as the whole-blob writes.
+  const ITEM_PREFIX = 'ITEMDOC\u0001';
+  const ITEM_SEP = '\u0001';
+
   async function writeOnce(key, value){
+    if(key.indexOf(ITEM_PREFIX) === 0){
+      const rest = key.slice(ITEM_PREFIX.length);
+      const sep = rest.indexOf(ITEM_SEP);
+      const collKey = rest.slice(0, sep);
+      const id = rest.slice(sep + 1);
+      await writeItemDoc(collKey, id, value);
+      return;
+    }
     const ref = fsMod.doc(db, 'appdata', key);
     if(value === null){ await fsMod.deleteDoc(ref); return; }
     if(value.length <= CHUNK){
@@ -242,6 +328,13 @@ if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
     paint();
     if(timers.has(key)) clearTimeout(timers.get(key));
     timers.set(key, setTimeout(()=> flush(key), 400));
+  };
+
+  // Persist / delete ONE record of an item collection. value===null deletes.
+  // Routed through __ssPersist so it shares debounce, retry, offline queue and
+  // the "waiting to sync" status — each record id debounces independently.
+  window.__ssPersistItem = function(collKey, id, value){
+    window.__ssPersist(ITEM_PREFIX + collKey + ITEM_SEP + id, value);
   };
 
   // Anything still in the debounce window goes out immediately; if something is

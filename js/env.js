@@ -110,3 +110,32 @@
     else show();
   }
 })();
+
+/* ============================================================================
+ * ITEM COLLECTIONS — the collections that MANY people edit at once.
+ *
+ * Declared here (loads first) so both store.js and firebase-config.js share
+ * ONE list. Each of these is stored one-document-per-record in Firestore, so
+ * two people adding rows at the same time never overwrite each other. Every
+ * record MUST carry a stable unique `id`.
+ *
+ * NOT listed here (kept as a single whole-blob document, last-write-wins):
+ *   - mod_store_config       one settings object, edited by one admin at a time
+ *   - mod_store_stockpublic  a derived quantities snapshot, rewritten wholesale
+ * ==========================================================================*/
+window.__ITEM_COLLECTIONS = new Set([
+  'mod_store_products',
+  'mod_store_orders',
+  'mod_store_deliveries',
+  'mod_store_lots',
+  'mod_store_stocklog',
+  'mod_store_expenses',
+  'mod_store_opex',
+  'mod_store_promotions',
+  'mod_store_orderlog',
+  'mod_store_productlog',
+  'mod_store_opexlog'
+]);
+// Flips true once the first hydrate finishes. Until then, item writes are
+// blocked so a half-loaded page can't overwrite the cloud with a short list.
+window.__ssHydrated = false;

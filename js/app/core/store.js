@@ -41,6 +41,76 @@ const LOCAL_ONLY_KEYS = new Set([
   'app_lang_v1', 'app_theme_mode_v1', 'app_ink_v1'
 ]);
 
+/* ============================================================
+   PER-RECORD WRITE LAYER (item collections)
+
+   The collections in window.__ITEM_COLLECTIONS are edited by many people at
+   once. Writing the whole array back on every save (last-write-wins) means
+   two people saving together clobber each other. Instead we keep, per device,
+   a snapshot of what THIS device last saw for each collection, and on every
+   Store.set(key, array) we diff against it and persist only the records that
+   were actually added / changed / removed — one Firestore document each. A
+   record another device just added (not in our array, and not in our snapshot)
+   is never seen as a deletion, so we can't wipe someone else's row.
+
+   The snapshot is compared against the DEVICE's own previous state, not the
+   cloud — that's what makes "not in my list because it hasn't synced yet"
+   safe: it isn't in my snapshot either, so it's left untouched.
+   ============================================================ */
+const __itemSnap = {};   // storageKey -> Map(id -> JSON string of that record)
+
+function __isItemColl(key){
+  return !!(window.__ITEM_COLLECTIONS && window.__ITEM_COLLECTIONS.has(key)
+            && window.__ssBackend === 'firestore');
+}
+function __snapFromArray(arr){
+  const m = new Map();
+  (Array.isArray(arr) ? arr : []).forEach(it=>{
+    if(it && it.id != null) m.set(it.id, JSON.stringify(it));
+  });
+  return m;
+}
+// After every hydrate the cache is replaced wholesale, so our per-device
+// snapshots must be re-based to that fresh state or the next diff is wrong.
+// firebase-config.js calls this once hydrate completes.
+window.__rebuildItemSnaps = function(){
+  if(!window.__ITEM_COLLECTIONS) return;
+  window.__ITEM_COLLECTIONS.forEach(key=>{
+    let arr = [];
+    try{ arr = JSON.parse(window.__ssCache[key] || '[]'); }catch(e){ arr = []; }
+    __itemSnap[key] = __snapFromArray(arr);
+  });
+};
+
+// Diff `arr` against this device's snapshot for `key` and persist only the
+// records that changed. Returns arr unchanged (callers expect their value back).
+function __setItemCollection(key, arr){
+  // Guard: never write an item collection before the first hydrate — a
+  // half-loaded array here is exactly what used to wipe the cloud.
+  if(!window.__ssHydrated){
+    logAppError('ยังโหลดข้อมูลไม่เสร็จ — ยังบันทึกไม่ได้ กรุณารอสักครู่แล้วลองใหม่ (' + key + ')', new Error('write before hydrate'));
+    return arr;
+  }
+  const prev = __itemSnap[key] || new Map();
+  const next = __snapFromArray(arr);
+  // added / changed
+  next.forEach((json, id)=>{
+    if(prev.get(id) !== json && typeof window.__ssPersistItem === 'function'){
+      window.__ssPersistItem(key, id, json);
+    }
+  });
+  // removed (present on this device before, gone now)
+  prev.forEach((_json, id)=>{
+    if(!next.has(id) && typeof window.__ssPersistItem === 'function'){
+      window.__ssPersistItem(key, id, null);
+    }
+  });
+  __itemSnap[key] = next;
+  // Keep the in-memory cache in sync so the sync getRaw/list face still works.
+  window.__ssCache[key] = JSON.stringify(Array.isArray(arr) ? arr : []);
+  return arr;
+}
+
 const Store = {
   /* ---- sync face: Base App ----
      Reads/writes the in-memory cache when the Firestore backend is live
@@ -98,6 +168,9 @@ const Store = {
     return raw == null ? null : JSON.parse(raw);
   },
   async set(key, value){
+    // Item collections write one document per record (see __setItemCollection);
+    // everything else is a single whole-blob document as before.
+    if(__isItemColl(key)) return __setItemCollection(key, value);
     this.setRaw(key, JSON.stringify(value));
     return value;
   },
