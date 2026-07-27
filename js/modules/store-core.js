@@ -4332,6 +4332,9 @@
     return changed;
   }
   function ptypeColor(name){ return ((config.productTypes||[]).find(t=> t.name === name) || {}).color || '#999'; }
+  // Category is stored on the product as its permanent `name` key; show the
+  // Thai or English label for the current app language instead of the raw key.
+  function ptypeLabel(name){ const t=(config.productTypes||[]).find(x=> x.name === name); return t ? itemLabel(t) : name; }
   function originColor(name){ return ((config.costOrigins||[]).find(o=> o.name === name) || {}).color || '#8A8F80'; }
   // Stock accounting for a product across all orders (matched by productId).
   //  reserved  = qty in orders billed but NOT yet paid
@@ -4454,7 +4457,7 @@
           <td class="num ${low?'art-neg':''}" style="font-weight:700;">${st.remaining}</td>
           <td class="num art-reserved">${st.reserved || '-'}</td>
           <td class="num art-sold">${st.sold || '-'}</td>
-          <td>${p.productType ? `<span class="art-pill" style="background:${ptypeColor(p.productType)}">${esc(p.productType)}</span>` : '<span style="color:var(--c-muted);">-</span>'}</td>
+          <td>${p.productType ? `<span class="art-pill" style="background:${ptypeColor(p.productType)}">${esc(ptypeLabel(p.productType))}</span>` : '<span style="color:var(--c-muted);">-</span>'}</td>
           <td><span class="art-pill" style="background:${prodTagColor(productStatusOf(p))}">${esc(prodTagLabel(productStatusOf(p)))}</span></td>
           <td class="art-edited">${esc(editedLabel(p))}</td>
           <td><div class="art-row-actions">
@@ -5257,7 +5260,7 @@
           <td>${dateStr}${timeStr?` <span class="sh-time">${timeStr}</span>`:''}</td>
           <td><span class="art-pill" style="background:${r.type==='new'?'#6B8F71':'#C97B4E'}">${esc(r.type==='new'?T('sh.typeNew'):T('sh.typeRestock'))}</span></td>
           <td>${esc(r.productName)}</td>
-          <td>${r.productType ? `<span class="art-pill" style="background:${ptypeColor(r.productType)}">${esc(r.productType)}</span>` : '<span style="color:var(--c-muted);">-</span>'}</td>
+          <td>${r.productType ? `<span class="art-pill" style="background:${ptypeColor(r.productType)}">${esc(ptypeLabel(r.productType))}</span>` : '<span style="color:var(--c-muted);">-</span>'}</td>
           <td class="num art-sold" style="font-weight:700;">+${r.qty}</td>
           <td>${r.origin ? `<span class="art-pill" style="background:${originColor(r.origin)}">${esc(r.origin)}</span>` : '<span style="color:var(--c-muted);">-</span>'}</td>
           <td class="num">${r.cost != null ? fmt(r.cost) : '-'}</td>
