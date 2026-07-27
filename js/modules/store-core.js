@@ -680,7 +680,7 @@
   }
   function delAssignCells(o){
     const canA = (typeof window.roleCanAccess !== 'function') || window.roleCanAccess(window.currentRole, 'editDeliveryAssign');
-    if(!canA) return `<td>${esc(o.deliveryMethod || '-')}</td><td>${esc(o.deliveryResponsible || '-')}</td>`;
+    if(!canA) return `<td>${esc(shipTypeLabel(o.deliveryMethod))}</td><td>${esc(o.deliveryResponsible || '-')}</td>`;
     const types = config.shippingTypes || [];
     const tCol = (types.find(st=> st.name === o.deliveryMethod) || {}).color || '#888';
     const typeCell = `<td><select class="del-ship art-inline-sel" data-oid="${esc(o.id)}" style="background:${tCol};"><option value="">-</option>${types.map(st=> `<option value="${esc(st.name)}" ${o.deliveryMethod===st.name?'selected':''}>${esc(itemLabel(st))}</option>`).join('')}</select></td>`;
@@ -2407,7 +2407,7 @@
                 <td>${esc(e.productName||'-')}</td>
                 <td>${esc(dispName('productTypes', e.productType) || '-')}</td>
                 <td class="num">${e.qty||0}</td>
-                <td><span class="art-pill" style="background:${originColor(e.origin)}">${esc(e.origin||'-')}</span></td>
+                <td><span class="art-pill" style="background:${originColor(e.origin)}">${esc(originLabel(e.origin))}</span></td>
                 <td class="num">${fmtD(e.cost)}</td>
                 <td class="num" style="font-weight:700;">${fmtD(amount)}</td>
                 <td>${esc(e.signature||'-')}</td>
@@ -3105,7 +3105,7 @@
                 <td>${esc(dispName('paymentModes', o.paymentMode) || '-')}</td>
                 <td class="num">${fmtD(o.paidAmount)}</td>
                 <td class="num ${pendingOf(o) > 0 ? 'art-pending-due' : ''}">${fmtD(pendingOf(o))}</td>
-                <td>${esc(o.deliveryMethod||'-')}</td>
+                <td>${esc(shipTypeLabel(o.deliveryMethod))}</td>
                 <td>${esc(o.deliveryResponsible||'-')}</td>
                 <td class="art-edited">${esc(editedLabel(o))}</td>
                 <td class="led-sticky-seller">${esc(o.seller || o.createdBy || '-')}</td>
@@ -3187,7 +3187,7 @@
           <td>${esc(dispName('paymentModes', o.paymentMode) || '-')}</td>
           <td class="num">${fmtD(o.paidAmount)}</td>
           <td class="num ${pendingOf(o) > 0 ? 'art-pending-due' : ''}">${fmtD(pendingOf(o))}</td>
-          <td>${esc(o.deliveryMethod||'-')}</td>
+          <td>${esc(shipTypeLabel(o.deliveryMethod))}</td>
           <td>${esc(o.deliveryResponsible||'-')}</td>
           <td>${esc(o.seller || o.createdBy || '-')}</td>
           <td class="art-edited">${esc(editedLabel(o))}</td>
@@ -4336,6 +4336,10 @@
   // Thai or English label for the current app language instead of the raw key.
   function ptypeLabel(name){ const t=(config.productTypes||[]).find(x=> x.name === name); return t ? itemLabel(t) : name; }
   function originColor(name){ return ((config.costOrigins||[]).find(o=> o.name === name) || {}).color || '#8A8F80'; }
+  // Same rule as ptypeLabel: these are stored on records as their permanent
+  // `name` key; show the TH/EN label for the current language when displaying.
+  function originLabel(name){ const o=(config.costOrigins||[]).find(x=> x.name === name); return o ? itemLabel(o) : (name||'-'); }
+  function shipTypeLabel(name){ const t=(config.shippingTypes||[]).find(x=> x.name === name); return t ? itemLabel(t) : (name||'-'); }
   // Stock accounting for a product across all orders (matched by productId).
   //  reserved  = qty in orders billed but NOT yet paid
   //  sold      = qty in orders whose invoice status reached "paid"
@@ -4392,7 +4396,7 @@
     const rem = (l.qtyIn||0) - a.reserved - a.sold;
     return `<tr class="${cls}" ${dataAttr} style="display:none;">
         <td></td><td></td>
-        <td class="${indent?'prod-sub2':''}"><span class="art-pill" style="background:${originColor(l.origin)}">${esc(l.origin||'-')}</span></td>
+        <td class="${indent?'prod-sub2':''}"><span class="art-pill" style="background:${originColor(l.origin)}">${esc(originLabel(l.origin))}</span></td>
         <td class="num">${fmt(l.cost)}</td>
         <td></td><td></td>
         <td class="num">${rem}</td>
@@ -5262,7 +5266,7 @@
           <td>${esc(r.productName)}</td>
           <td>${r.productType ? `<span class="art-pill" style="background:${ptypeColor(r.productType)}">${esc(ptypeLabel(r.productType))}</span>` : '<span style="color:var(--c-muted);">-</span>'}</td>
           <td class="num art-sold" style="font-weight:700;">+${r.qty}</td>
-          <td>${r.origin ? `<span class="art-pill" style="background:${originColor(r.origin)}">${esc(r.origin)}</span>` : '<span style="color:var(--c-muted);">-</span>'}</td>
+          <td>${r.origin ? `<span class="art-pill" style="background:${originColor(r.origin)}">${esc(originLabel(r.origin))}</span>` : '<span style="color:var(--c-muted);">-</span>'}</td>
           <td class="num">${r.cost != null ? fmt(r.cost) : '-'}</td>
           <td>${esc(r.signature)}</td>
           <td>${r.bill ? `<button type="button" class="sh-bill" data-bill="${r.id}">📎</button>` : '<span style="color:var(--c-muted);">-</span>'}</td>
