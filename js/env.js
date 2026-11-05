@@ -121,7 +121,6 @@
  *
  * NOT listed here (kept as a single whole-blob document, last-write-wins):
  *   - mod_store_config       one settings object, edited by one admin at a time
- *   - mod_store_stockpublic  a derived quantities snapshot, rewritten wholesale
  * ==========================================================================*/
 window.__ITEM_COLLECTIONS = new Set([
   'mod_store_products',

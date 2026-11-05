@@ -512,7 +512,7 @@ function applyTheme(id){
   // so it tracks all 22 presets + custom + the light/dark toggle automatically.
   const scheme = luminance(tokens['--c-bg']) < 0.4 ? 'dark' : 'light';
   themeStyleEl().textContent =
-    'body.jigsaw-theme, .login-screen{\n' + THEME_TOKENS.map(k=> `  ${k}:${tokens[k]};`).join('\n') +
+    'body.jigsaw-theme, .login-screen, .app-loading{\n' + THEME_TOKENS.map(k=> `  ${k}:${tokens[k]};`).join('\n') +
     '\n  color-scheme:' + scheme + ';\n}';
   saveThemeId(th.id);
 }

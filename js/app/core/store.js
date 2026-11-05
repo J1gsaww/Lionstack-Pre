@@ -58,6 +58,12 @@ const LOCAL_ONLY_KEYS = new Set([
    safe: it isn't in my snapshot either, so it's left untouched.
    ============================================================ */
 const __itemSnap = {};   // storageKey -> Map(id -> JSON string of that record)
+// Records another device changed that the module on screen hasn't re-read yet
+// (it waits while a form is open). key -> Map(id -> the JSON the module still
+// holds, or null if the record is new to it). Lets __setItemCollection tell
+// "the module's old copy" apart from "a real edit made here".
+const __remoteStale = {};
+window.__markItemsSeen = function(key){ delete __remoteStale[key]; };
 
 function __isItemColl(key){
   return !!(window.__ITEM_COLLECTIONS && window.__ITEM_COLLECTIONS.has(key)
@@ -82,6 +88,39 @@ window.__rebuildItemSnaps = function(){
   });
 };
 
+// Another device changed ONE record (live sync). Apply it to the cache and to
+// this device's snapshot — the snapshot must move too, otherwise the next local
+// save would see the remote version as "changed here" and write it back, or
+// see a record removed elsewhere as missing and leave it alone. raw===null
+// means the record was deleted. Returns true when something actually changed.
+window.__applyRemoteItem = function(key, id, raw){
+  let arr;
+  try{ arr = JSON.parse(window.__ssCache[key] || '[]'); }catch(e){ arr = []; }
+  if(!Array.isArray(arr)) arr = [];
+  const i = arr.findIndex(x=> x && String(x.id) === String(id));
+  const snap = __itemSnap[key] || (__itemSnap[key] = new Map());
+  const stale = __remoteStale[key] || (__remoteStale[key] = new Map());
+  if(i >= 0 || raw != null){
+    const recId = i >= 0 ? arr[i].id : id;
+    if(!stale.has(String(recId))) stale.set(String(recId), i >= 0 ? JSON.stringify(arr[i]) : null);
+  }
+  if(raw == null){
+    if(i < 0) return false;
+    const recId = arr[i].id;
+    arr.splice(i, 1);
+    snap.delete(recId);
+  }else{
+    let rec; try{ rec = JSON.parse(raw); }catch(e){ return false; }
+    if(!rec || rec.id == null) return false;
+    const json = JSON.stringify(rec);
+    if(i >= 0 && JSON.stringify(arr[i]) === json) return false;
+    if(i >= 0) arr[i] = rec; else arr.push(rec);
+    snap.set(rec.id, json);
+  }
+  window.__ssCache[key] = JSON.stringify(arr);
+  return true;
+};
+
 // Diff `arr` against this device's snapshot for `key` and persist only the
 // records that changed. Returns arr unchanged (callers expect their value back).
 function __setItemCollection(key, arr){
@@ -93,21 +132,37 @@ function __setItemCollection(key, arr){
   }
   const prev = __itemSnap[key] || new Map();
   const next = __snapFromArray(arr);
+  const stale = __remoteStale[key];
+  // A record whose JSON is exactly the module's pre-sync copy wasn't edited
+  // here — it's just out of date. Keep the remote version instead of writing
+  // the old one back (or resurrecting / deleting it).
+  const isStaleCopy = (id, json)=> !!stale && stale.has(String(id)) && stale.get(String(id)) === json;
+  const keepRemote = new Set();
   // added / changed
   next.forEach((json, id)=>{
-    if(prev.get(id) !== json && typeof window.__ssPersistItem === 'function'){
-      window.__ssPersistItem(key, id, json);
-    }
+    if(prev.get(id) === json) return;
+    if(isStaleCopy(id, json)){ keepRemote.add(id); return; }
+    if(typeof window.__ssPersistItem === 'function') window.__ssPersistItem(key, id, json);
   });
   // removed (present on this device before, gone now)
   prev.forEach((_json, id)=>{
-    if(!next.has(id) && typeof window.__ssPersistItem === 'function'){
-      window.__ssPersistItem(key, id, null);
-    }
+    if(next.has(id)) return;
+    if(isStaleCopy(id, null)){ keepRemote.add(id); return; }   // added elsewhere, not loaded here yet
+    if(typeof window.__ssPersistItem === 'function') window.__ssPersistItem(key, id, null);
   });
-  __itemSnap[key] = next;
+  // New snapshot + cache = what this device saved, with the remote version
+  // kept for every record the module only had an old copy of.
+  const out = [];
+  (Array.isArray(arr) ? arr : []).forEach(it=>{
+    if(!it || it.id == null || !keepRemote.has(it.id)){ out.push(it); return; }
+    if(prev.has(it.id)) out.push(JSON.parse(prev.get(it.id)));        // remote edit wins; remote delete drops it
+  });
+  keepRemote.forEach(id=>{ if(!next.has(id) && prev.has(id)) out.push(JSON.parse(prev.get(id))); });   // remote add the module lacks
+  const nextSnap = new Map(next);
+  keepRemote.forEach(id=>{ if(prev.has(id)) nextSnap.set(id, prev.get(id)); else nextSnap.delete(id); });
+  __itemSnap[key] = nextSnap;
   // Keep the in-memory cache in sync so the sync getRaw/list face still works.
-  window.__ssCache[key] = JSON.stringify(Array.isArray(arr) ? arr : []);
+  window.__ssCache[key] = JSON.stringify(out);
   return arr;
 }
 
@@ -143,7 +198,17 @@ const Store = {
       if(BOOT_MIRROR_KEYS.has(key)){ try{ localStorage.setItem(key, value); }catch(e){} }
       return true;
     }
-    localStorage.setItem(key, value);
+    try{ localStorage.setItem(key, value); }
+    catch(e){
+      // Local test mode keeps everything (images included) in the browser's
+      // ~5 MB localStorage. Say so instead of failing silently; Firebase mode
+      // moves images to Storage and has no such limit.
+      if(e && (e.name === 'QuotaExceededError' || e.code === 22)){
+        alert('บันทึกไม่สำเร็จ: พื้นที่เก็บข้อมูลในเบราว์เซอร์เต็ม (โหมด Local จำกัด ~5MB รวมรูปภาพ)\n'
+          + 'ลดจำนวน/ขนาดรูปสำหรับการทดสอบ หรือใช้โหมด Firebase ซึ่งเก็บรูปไว้ที่ Storage ได้ไม่จำกัด');
+      }
+      throw e;
+    }
     return true;
   },
   removeRaw(key){

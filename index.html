@@ -14,8 +14,29 @@
 <!-- ============ LOGIN SCREEN (Firebase Auth — see js/auth.js) ============
      Kept as a UI shell for when real auth is wired in. By default the
      mock skips this screen and goes straight into the app. -->
+<!-- Loading screen: shown from page load until auth decides what to show, and
+     while company data is being downloaded after the device is unlocked.
+     auth.js hides it (showLogin / enterApp). -->
+<div id="appLoading" class="app-loading" role="status" aria-live="polite">
+  <div class="app-loading-card">
+    <div class="app-loading-spin"></div>
+    <div class="app-loading-text" id="appLoadingText">กำลังเชื่อมต่อ…</div>
+    <div class="app-loading-bar"><span id="appLoadingBar"></span></div>
+    <div class="app-loading-sub" id="appLoadingSub"></div>
+  </div>
+</div>
+
 <div id="loginScreen" class="login-screen" style="display:none;">
-  <div class="login-card">
+  <div class="login-card" id="loginCard">
+    <div class="login-stage-band" id="loginStageBand" style="display:none;">
+      <span class="login-stage-ico" id="loginStageIco"></span>
+      <span class="login-stage-label" id="loginStageLabel"></span>
+    </div>
+    <div class="login-steps" id="loginSteps" style="display:none;">
+      <span class="login-step" data-step="1"><i>1</i>เชื่อมอุปกรณ์</span>
+      <span class="login-step-line"></span>
+      <span class="login-step" data-step="2"><i>2</i>พนักงานเข้าสู่ระบบ</span>
+    </div>
     <div class="login-logo-wrap">
       <img class="app-logo-img" data-default="assets/logo.png" src="assets/logo.png" alt="Lionstack" onerror="this.style.display='none'">
     </div>
@@ -27,14 +48,14 @@
         <input type="text" id="loginUsername" autocomplete="username" placeholder="username">
       </div>
       <div class="field full" style="margin-bottom:14px;">
-        <label data-i18n="ui.password">Password</label>
+        <label data-i18n="ui.password" id="loginPassLabel">Password</label>
         <input type="password" id="loginPassword" autocomplete="current-password" placeholder="••••••••">
       </div>
       <div id="loginError" class="login-error" style="display:none;"></div>
       <button type="submit" class="btn btn-primary" id="loginSubmitBtn" style="width:100%;" data-i18n="login.submit">เข้าสู่ระบบ</button>
       <button type="button" class="btn btn-ghost" id="loginDevBtn" style="width:100%; margin-top:10px;">Dev Login</button>
     </form>
-    <div class="login-hint">ล็อกอินด้วยไอดีพนักงานของคุณ</div>
+    <div class="login-hint" id="loginFootHint">ล็อกอินด้วยไอดีพนักงานของคุณ</div>
   </div>
 </div>
 
@@ -699,13 +720,12 @@
      immediately, before app.js, and registerModule wouldn't exist yet. They use
      window.registerModule (module scope has no access to app.js's top level).
      Remove a line to ship without that module; nothing in app.js references it. -->
-<!-- accounting + diary modules disabled (kept dormant) — app is Simple Store + Storefront only.
+<!-- accounting + diary modules disabled (kept dormant) — app is Simple Store only.
      Re-enable by uncommenting:
 <script type="module" src="js/modules/accounting.js"></script>
 <script type="module" src="js/modules/diary.js"></script>
 -->
 <script type="module" src="js/modules/store-core.js"></script>
-<script type="module" src="js/modules/storefront.js"></script>
 <script type="module" src="js/modules/employees.js"></script>
 <script type="module" src="js/modules/payroll.js"></script>
 <script type="module" src="js/modules/placeholders.js"></script>

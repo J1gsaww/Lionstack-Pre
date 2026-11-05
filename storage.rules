@@ -1,0 +1,25 @@
+rules_version = '2';
+
+// Firebase Storage rules for Lionstack.
+// Paste into Firebase Console → Storage → Rules → Publish.
+//
+// The app uploads every picture (product photos, payment slips, bills,
+// delivery proofs) to media/<xx>/<sha256>.<ext> right before it saves the
+// record, then stores the download URL in Firestore.
+//  - Only signed-in staff may upload.
+//  - Files are named by their content hash, so re-uploading one (another
+//    device, a retry) writes identical bytes; the app never deletes files.
+//  - Reading goes through the download URL's token, so <img> tags and printed
+//    documents work without extra rules.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /media/{shard}/{file} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null;
+      allow delete: if false;
+    }
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

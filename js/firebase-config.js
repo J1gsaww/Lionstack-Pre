@@ -12,7 +12,7 @@
  *   window.firebaseAuth  the Auth instance auth.js signs in against
  *
  * Storage shape: collection `appdata`, one document per storage key, field `v`
- * holding the JSON string. shop.html reads the same documents directly.
+ * holding the JSON string.
  *
  * EVERYTHING GOES TO FIREBASE. The only things that stay on the device are the
  * three personal preferences store.js keeps in LOCAL_ONLY_KEYS (language,
@@ -29,8 +29,12 @@
  *     put in read-only mode with a red banner, because writing to localStorage
  *     instead would silently split the data across devices.
  *
- * Documents are capped at 1 MiB by Firestore and this app stores base64 images
- * inline, so a big value is SPLIT across `v0..vN` with `parts` saying how many.
+ * Documents are capped at 1 MiB by Firestore. Images are picked in the UI as
+ * base64 data URLs; right before a write, every data URL inside the value is
+ * uploaded to Firebase Storage (content-addressed: media/<sha256>.<ext>) and
+ * replaced by its download URL — see offloadMedia(). So a record carries short
+ * links, not image bytes, and there is no cap on how many or how big. A value
+ * that is still large is SPLIT across `v0..vN` with `parts` saying how many.
  * ==========================================================================*/
 
 const SDK = 'https://www.gstatic.com/firebasejs/10.12.2/';
@@ -72,12 +76,13 @@ if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
   window.__storeReady = Promise.resolve();
   window.__hydrateStore = async ()=>{};
 }else{
-  let db = null, fsMod = null, ready = null;
+  let db = null, fsMod = null, ready = null, fbApp = null;
   const pending = new Map();   // key -> latest value waiting for its debounce
   const timers  = new Map();
   const failed  = new Map();   // key -> value that exhausted its retries
   const queued  = new Map();   // key -> waiting for the server, already safe on disk
   let inFlight = 0;
+  const inFlightKeys = new Set();   // keys being written right now (incl. image upload)
   let signedIn = false;        // rules reject every write until someone signs in
   const SLOW_MS = 8000;        // after this a write is "queued", not "in progress"
 
@@ -113,6 +118,7 @@ if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
       import(SDK + 'firebase-auth.js')
     ]);
     const app = initializeApp(window.FIREBASE_CONFIG);
+    fbApp = app;
     // Persistent cache = Firestore keeps unsent writes on disk and replays them
     // after a reload, which is what makes "offline for a while" survivable.
     try{
@@ -126,6 +132,7 @@ if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
     fsMod = fs;
     window.__fs = fs;
     window.firebaseAuth = authMod.getAuth(app);
+    window.__fbAuthMod = authMod;   // auth.js reuses this — same SDK build, no second download
     window.__ssBackend = 'firestore';
     // Writes made before sign-in would all bounce off the rules, so hold them
     // in the pending map and release them the moment a session exists.
@@ -138,17 +145,66 @@ if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
 
   const ITEM_COLLS = window.__ITEM_COLLECTIONS || new Set();
 
-  // Read one item collection (one document per record) back into a JSON array
-  // string, the same shape store.js caches for the whole-blob keys.
-  async function hydrateItemCollection(key){
-    const snap = await fsMod.getDocs(fsMod.collection(db, key));
-    const arr = [];
-    snap.forEach(d=>{
-      const raw = joinParts(d.data());
-      if(raw == null) return;
-      try{ arr.push(JSON.parse(raw)); }catch(e){ /* skip a corrupt record, keep the rest */ }
-    });
-    return JSON.stringify(arr);
+  /* ---- images → Firebase Storage ----
+     Any `data:<mime>;base64,...` string in a value about to be written is
+     uploaded once and swapped for its download URL. The path is the SHA-256 of
+     the bytes, so the same picture is only ever stored once (retries, copies on
+     several rows, other devices), and a re-save of an unchanged record reuses
+     the URL from memory without touching the network. */
+  const DATA_URL_RE = /data:([a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+);base64,[A-Za-z0-9+/=]+/g;
+  const mediaUrlOf = new Map();          // data URL string -> download URL (this session)
+  let storageApi = null, storage = null;
+  // Set when Storage refuses us (rules not published, bucket not created…):
+  // from then on images stay inline for this session instead of every save
+  // waiting on an upload that can't succeed.
+  let storageOff = false;
+  const UPLOAD_TIMEOUT_MS = 20000;
+  async function getStorageApi(){
+    if(!storageApi){
+      storageApi = await import(SDK + 'firebase-storage.js');
+      storage = storageApi.getStorage(fbApp);
+      try{ storage.maxUploadRetryTime = UPLOAD_TIMEOUT_MS; storage.maxOperationRetryTime = UPLOAD_TIMEOUT_MS; }catch(e){}
+    }
+    return storageApi;
+  }
+  async function uploadDataUrl(dataUrl){
+    if(mediaUrlOf.has(dataUrl)) return mediaUrlOf.get(dataUrl);
+    const comma = dataUrl.indexOf(',');
+    const mime = dataUrl.slice(5, dataUrl.indexOf(';'));
+    const bin = atob(dataUrl.slice(comma + 1));
+    const bytes = new Uint8Array(bin.length);
+    for(let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+    const hash = Array.from(digest, b=> b.toString(16).padStart(2, '0')).join('');
+    const ext = ((mime.split('/')[1] || 'bin').replace('jpeg', 'jpg').replace(/[^a-z0-9]/gi, '') || 'bin').slice(0, 5).toLowerCase();
+    const S = await getStorageApi();
+    const ref = S.ref(storage, 'media/' + hash.slice(0, 2) + '/' + hash + '.' + ext);
+    await S.uploadBytes(ref, bytes, { contentType: mime, cacheControl: 'public, max-age=31536000, immutable' });
+    const url = await S.getDownloadURL(ref);
+    mediaUrlOf.set(dataUrl, url);
+    return url;
+  }
+  // Never blocks a save: an image that can't be uploaded simply stays inline
+  // (exactly how records were stored before Storage), so bills still save
+  // even while Storage isn't set up.
+  async function offloadMedia(value){
+    if(storageOff || typeof value !== 'string' || value.indexOf('data:') < 0) return value;
+    const found = [...new Set(value.match(DATA_URL_RE) || [])].filter(u=> u.length > 512);
+    if(!found.length) return value;
+    const withTimeout = (p)=> Promise.race([p, new Promise((_, rej)=> setTimeout(()=> rej(new Error('upload timeout')), UPLOAD_TIMEOUT_MS))]);
+    const urls = await Promise.all(found.map(u=> withTimeout(uploadDataUrl(u)).catch(err=>{
+      const code = (err && err.code) || '';
+      if(!storageOff && /unauthorized|unauthenticated|bucket-not-found|project-not-found|unknown|Failed to fetch|import/i.test(code + ' ' + (err && err.message))){
+        storageOff = true;
+        console.warn('[firebase] Storage unavailable — images stay inline for this session (' + (code || err.message) + '). Publish storage.rules to enable.');
+      }else{
+        console.warn('[firebase] image upload failed, kept inline', err);
+      }
+      return null;
+    })));
+    let out = value;
+    found.forEach((u, i)=>{ if(urls[i]) out = out.split(u).join(urls[i]); });
+    return out;
   }
 
   // One-time move: an item collection still living as a legacy whole-blob
@@ -172,14 +228,120 @@ if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
     return JSON.stringify(arr);
   }
 
-  window.__hydrateStore = async function(){
+  /* ---- LIVE SYNC ----
+     Every collection is read through onSnapshot, not getDocs: the first server
+     snapshot is the initial load (hydrate), and every snapshot after that is
+     another device's change arriving within a second or two. Changes this
+     device still has queued are skipped so a remote copy can't overwrite an
+     edit that hasn't been sent yet. Each change is applied to the cache and
+     announced with a 'store-remote-change' event; module-registry.js reloads
+     the modules and redraws the page. */
+  const unsubs = [];
+  const localBusy = (key)=> pending.has(key) || queued.has(key) || failed.has(key) || inFlightKeys.has(key);
+  let remoteKeys = new Set(), remoteTimer = null;
+  function announceRemote(key){
+    remoteKeys.add(key);
+    if(remoteTimer) return;
+    remoteTimer = setTimeout(()=>{
+      const keys = [...remoteKeys]; remoteKeys = new Set(); remoteTimer = null;
+      window.dispatchEvent(new CustomEvent('store-remote-change', { detail: { keys } }));
+    }, 250);
+  }
+  function onRemoteItems(key, changes){
+    let any = false;
+    changes.forEach(c=>{
+      const id = c.doc.id;
+      if(localBusy(ITEM_PREFIX + key + ITEM_SEP + id)) return;
+      const raw = c.type === 'removed' ? null : joinParts(c.doc.data());
+      if(typeof window.__applyRemoteItem === 'function' && window.__applyRemoteItem(key, id, raw)) any = true;
+    });
+    if(any) announceRemote(key);
+  }
+  function onRemoteBlobs(changes){
+    changes.forEach(c=>{
+      const k = c.doc.id;
+      if(ITEM_COLLS.has(k) || localBusy(k)) return;
+      if(c.type === 'removed'){ if(k in window.__ssCache){ delete window.__ssCache[k]; announceRemote(k); } return; }
+      const raw = joinParts(c.doc.data());
+      if(raw == null || window.__ssCache[k] === raw) return;
+      window.__ssCache[k] = raw;
+      announceRemote(k);
+    });
+  }
+  // Resolves with the first snapshot that came from the SERVER (a cached one is
+  // only accepted if the server hasn't answered within 12 s — offline start).
+  function listen(colRef, onLater){
+    return new Promise((resolve, reject)=>{
+      let first = true, cached = null;
+      const fallback = setTimeout(()=>{ if(first && cached){ first = false; console.warn('[firebase] server slow — starting from the offline cache'); resolve(cached); } }, 12000);
+      const unsub = fsMod.onSnapshot(colRef, { includeMetadataChanges: true }, (snap)=>{
+        if(first){
+          if(snap.metadata.fromCache){ cached = snap; return; }
+          first = false; clearTimeout(fallback); resolve(snap); return;
+        }
+        // Skip our own not-yet-confirmed writes; metadata-only changes are excluded by default.
+        const changes = snap.docChanges().filter(c=> !c.doc.metadata.hasPendingWrites);
+        if(changes.length) onLater(changes);
+      }, (err)=>{
+        if(first){ first = false; clearTimeout(fallback); reject(err); }
+        else console.warn('[firebase] live sync stopped', err);
+      });
+      unsubs.push(unsub);
+    });
+  }
+  /* ---- server counter (bill numbers) ----
+     counters/<name> = { n, at }. A Firestore TRANSACTION runs against the
+     server, so when two devices ask at the same moment one of them retries and
+     gets the next number — no two bills can share a number. `floor` is the
+     highest number already in use (from the bill list) so a brand-new counter
+     continues the existing sequence instead of restarting at 1. Rejects when it
+     can't reach the server or the rules refuse — callers fall back. */
+  window.__reserveSeq = async function(name, floor){
+    if(!db) await ready;
+    if(!db || !signedIn) throw new Error('not signed in');
+    const ref = fsMod.doc(db, 'counters', String(name).replace(/\//g, '_'));
+    const run = fsMod.runTransaction(db, async (tx)=>{
+      const snap = await tx.get(ref);
+      const cur = snap.exists() ? (Number(snap.data().n) || 0) : 0;
+      const n = Math.max(cur, Number(floor) || 0) + 1;
+      tx.set(ref, { n, at: Date.now() });
+      return n;
+    }, { maxAttempts: 8 });
+    return Promise.race([run, new Promise((_, rej)=> setTimeout(()=> rej(new Error('counter timeout')), 10000))]);
+  };
+
+  window.__stopLiveSync = ()=>{ unsubs.splice(0).forEach(u=>{ try{ u(); }catch(e){} }); };
+
+  // onProgress(done, total) is optional — auth.js uses it for the loading screen.
+  window.__hydrateStore = async function(onProgress){
     try{
       if(!db) await ready;
       if(!db) return;
       if(!signedIn){ console.info('[firebase] not signed in yet — skipping hydrate'); return; }
+      window.__stopLiveSync();   // a re-hydrate (new sign-in) starts fresh listeners
+      const t0 = performance.now();
+      const keys = [...ITEM_COLLS];
+      const total = keys.length + 1;
+      let done = 0;
+      const tick = ()=>{ done++; if(typeof onProgress === 'function'){ try{ onProgress(done, total); }catch(e){} } };
+      const toArrStr = (snap)=>{
+        const arr = [];
+        snap.forEach(d=>{
+          const raw = joinParts(d.data());
+          if(raw == null) return;
+          try{ arr.push(JSON.parse(raw)); }catch(e){ /* skip a corrupt record, keep the rest */ }
+        });
+        return JSON.stringify(arr);
+      };
 
-      // 1) whole-blob keys (config, stockpublic, base-app data) from appdata/*
-      const snap = await fsMod.getDocs(fsMod.collection(db, 'appdata'));
+      // All collections in parallel; each listener stays open afterwards.
+      const appdataP = listen(fsMod.collection(db, 'appdata'), onRemoteBlobs).then(snap=>{ tick(); return snap; });
+      const itemsP = Promise.all(keys.map(key=>
+        listen(fsMod.collection(db, key), (ch)=> onRemoteItems(key, ch)).then(snap=>{ tick(); return toArrStr(snap); })
+      ));
+      const [snap, itemStrs] = await Promise.all([appdataP, itemsP]);
+
+      // 1) whole-blob keys (config, base-app data) from appdata/*
       const next = {};
       const legacyBlobs = {};
       snap.forEach(d=>{
@@ -189,9 +351,10 @@ if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
         else next[d.id] = raw;
       });
 
-      // 2) item collections: read per-record docs, migrating any legacy blob first
-      for(const key of ITEM_COLLS){
-        let arrStr = await hydrateItemCollection(key);
+      // 2) item collections: per-record docs, migrating any legacy blob first
+      for(let i = 0; i < keys.length; i++){
+        const key = keys[i];
+        let arrStr = itemStrs[i];
         let arr; try{ arr = JSON.parse(arrStr); }catch(e){ arr = []; }
         if((!arr || !arr.length) && legacyBlobs[key]){
           const migrated = await migrateLegacyBlob(key, legacyBlobs[key]);
@@ -199,6 +362,7 @@ if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
         }
         next[key] = arrStr;
       }
+      console.info('[firebase] hydrate took ' + Math.round(performance.now() - t0) + ' ms (live sync on)');
 
       // Replace in place — store.js holds a reference to this object.
       Object.keys(window.__ssCache).forEach(k=> delete window.__ssCache[k]);
@@ -218,6 +382,7 @@ if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
   async function writeItemDoc(collKey, id, value){
     const ref = fsMod.doc(db, collKey, String(id));
     if(value === null){ await fsMod.deleteDoc(ref); return; }
+    value = await offloadMedia(value);
     if(value.length <= CHUNK){
       await fsMod.setDoc(ref, { v: value, parts: 0, at: Date.now() });
       return;
@@ -243,6 +408,7 @@ if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
     }
     const ref = fsMod.doc(db, 'appdata', key);
     if(value === null){ await fsMod.deleteDoc(ref); return; }
+    value = await offloadMedia(value);
     if(value.length <= CHUNK){
       await fsMod.setDoc(ref, { v: value, parts: 0, at: Date.now() });
       return;
@@ -271,7 +437,7 @@ if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
 
   async function push(key, value){
     let settled = false;
-    inFlight++; paint();
+    inFlight++; inFlightKeys.add(key); paint();
     // Stop calling it "in progress" once it is clearly just waiting for the network.
     const slow = setTimeout(()=>{
       if(settled) return;
@@ -289,6 +455,7 @@ if(window.APP_MODE !== 'firebase' || !window.FIREBASE_CONFIG){
       return false;
     }finally{
       settled = true;
+      inFlightKeys.delete(key);
       clearTimeout(slow);
       if(queued.has(key)) queued.delete(key); else inFlight--;
       paint();

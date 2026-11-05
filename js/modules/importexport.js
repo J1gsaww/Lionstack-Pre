@@ -34,8 +34,7 @@
       { name:'lots',            key:'mod_store_lots' },
       { name:'stockHistory',    key:'mod_store_stocklog' },
       { name:'productHistory',  key:'mod_store_productlog' },
-      { name:'deletedProducts', key:'mod_store_deleted_products' },
-      { name:'publicStock',     key:'mod_store_stockpublic', kind:'kv' }
+      { name:'deletedProducts', key:'mod_store_deleted_products' }
     ]},
     { id:'ieSell', sheets:[
       { name:'orders',        key:'mod_store_orders' },
@@ -44,10 +43,6 @@
     ]},
     { id:'ieDelivery', sheets:[
       { name:'deliveries', key:'mod_store_deliveries' }
-    ]},
-    { id:'ieStorefront', sheets:[
-      { name:'config',    key:'mod_storefront_config',    kind:'kv' },
-      { name:'published', key:'mod_storefront_published', kind:'kv' }
     ]},
     { id:'ieRevenue',   sheets:[], reads:['ieSell'] },
     { id:'ieCogs',      sheets:[], reads:['ieSell','ieStock'] },
@@ -837,7 +832,7 @@
     th: {
       'title':'นำเข้า / ส่งออก', 'crumb':'สำรองและกู้คืนข้อมูลแยกตามหน้า',
       'sub.ieOverall':'ทั้งหมด', 'sub.ieHistory':'ประวัติการนำเข้า', 'sub.ieStock':'จัดการสต๊อก', 'sub.ieSell':'การขาย', 'sub.ieDelivery':'การจัดส่ง',
-      'sub.ieStorefront':'หน้าร้าน', 'sub.ieRevenue':'รายได้ & บัญชี', 'sub.ieCogs':'ต้นทุนขาย & มูลค่าสต๊อก',
+      'sub.ieRevenue':'รายได้ & บัญชี', 'sub.ieCogs':'ต้นทุนขาย & มูลค่าสต๊อก',
       'sub.ieExpense':'รายจ่าย & เจ้าหนี้', 'sub.ieFinancial':'รายงานการเงิน', 'sub.iePayroll':'เงินเดือน',
       'sub.ieCalendar':'ปฏิทินพนักงาน', 'sub.ieEmployees':'พนักงาน & สิทธิ์', 'sub.ieSetting':'ตั้งค่าทั้งหมด',
       'desc.ieHistory':'ทุกครั้งที่มีการนำเข้าไฟล์ จะถูกบันทึกไว้ที่นี่ — ใครนำเข้าไฟล์อะไร เข้าหน้าไหน กี่แถว เมื่อไหร่',
@@ -846,7 +841,6 @@
       'desc.ieStock':'สินค้า · ต้นทุน (lot) · ประวัติสต๊อก · ประวัติแก้ไขสินค้า · สินค้าที่ถูกลบ',
       'desc.ieSell':'บิลขาย · ประวัติแก้ไขบิล · บิลที่ถูกลบ',
       'desc.ieDelivery':'ข้อมูลการจัดส่งของแต่ละบิล',
-      'desc.ieStorefront':'ตั้งค่าหน้าร้านและเวอร์ชันที่เผยแพร่',
       'desc.ieRevenue':'หน้านี้อ่านข้อมูลจากบิลขาย ไม่มีข้อมูลของตัวเอง',
       'desc.ieCogs':'คำนวณจากบิลขายและ lot ต้นทุน ไม่มีข้อมูลของตัวเอง',
       'desc.ieExpense':'ค่าใช้จ่ายดำเนินงาน · ประวัติแก้ไข · รายจ่ายค่าสินค้าที่ระบบลงให้',
@@ -882,7 +876,7 @@
     en: {
       'title':'Import / Export', 'crumb':'Back up and restore, page by page',
       'sub.ieOverall':'Overall', 'sub.ieStock':'Stock Management', 'sub.ieSell':'Sell Management', 'sub.ieDelivery':'Delivery',
-      'sub.ieStorefront':'Storefront', 'sub.ieRevenue':'Revenue & Accounting', 'sub.ieCogs':'COGS & Inventory',
+      'sub.ieRevenue':'Revenue & Accounting', 'sub.ieCogs':'COGS & Inventory',
       'sub.ieExpense':'Expense & Payable', 'sub.ieFinancial':'Financial Report', 'sub.iePayroll':'Payroll',
       'sub.ieCalendar':'Employee Calendar', 'sub.ieEmployees':'Employees & Access', 'sub.ieSetting':'All Settings', 'sub.ieHistory':'Import History',
       'desc.ieHistory':'Every import is logged here — who imported what file, into which page, how many rows, and when',
@@ -891,7 +885,6 @@
       'desc.ieStock':'Products · cost lots · stock history · product edit history · deleted products',
       'desc.ieSell':'Bills · bill edit history · deleted bills',
       'desc.ieDelivery':'Delivery details per bill',
-      'desc.ieStorefront':'Storefront configuration and the published snapshot',
       'desc.ieRevenue':'Reads the sales bills — owns no data of its own',
       'desc.ieCogs':'Computed from bills and cost lots — owns no data of its own',
       'desc.ieExpense':'Operating expenses · their edit log · auto-posted stock expenses',

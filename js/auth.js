@@ -40,7 +40,30 @@ async function isDevEmail(email){
   return h === DEV_EMAIL_HASH;
 }
 
+// ---- loading screen (index.html #appLoading) ----
+function showLoading(text, sub){
+  const el = document.getElementById('appLoading');
+  if(!el) return;
+  el.style.display = 'flex';
+  const t = document.getElementById('appLoadingText'); if(t) t.textContent = text || '';
+  const sb = document.getElementById('appLoadingSub'); if(sb) sb.textContent = sub || '';
+  const bar = document.getElementById('appLoadingBar');
+  if(bar){ bar.style.width = '0'; bar.parentElement.classList.remove('on'); }
+  const ls = document.getElementById('loginScreen'); if(ls) ls.style.display = 'none';
+}
+function loadingProgress(done, total){
+  const bar = document.getElementById('appLoadingBar');
+  if(bar && total){ bar.parentElement.classList.add('on'); bar.style.width = Math.round(done / total * 100) + '%'; }
+  const sb = document.getElementById('appLoadingSub');
+  if(sb && total) sb.textContent = done + ' / ' + total;
+}
+function hideLoading(){
+  const el = document.getElementById('appLoading');
+  if(el) el.style.display = 'none';
+}
+
 function enterApp(label){
+  hideLoading();
   const loginScreen = document.getElementById('loginScreen');
   const jigsawRoot = document.getElementById('jigsawRoot');
   if(loginScreen) loginScreen.style.display = 'none';
@@ -60,6 +83,7 @@ function enterApp(label){
 }
 
 function showLogin(){
+  hideLoading();
   const loginScreen = document.getElementById('loginScreen');
   const jigsawRoot = document.getElementById('jigsawRoot');
   if(loginScreen) loginScreen.style.display = 'flex';
@@ -181,6 +205,43 @@ function setLoginText(title, idLabel){
   if(lbl){ lbl.removeAttribute('data-i18n'); lbl.textContent = idLabel; }
 }
 
+// Stage look: 'device' (company code) vs 'employee' — different band, icon,
+// step indicator, labels and button so the two screens can't be mistaken.
+function setLoginStage(stage){
+  const card = document.getElementById('loginCard');
+  if(card){ card.classList.toggle('stage-device', stage === 'device'); card.classList.toggle('stage-employee', stage === 'employee'); }
+  const band = document.getElementById('loginStageBand');
+  const ico = document.getElementById('loginStageIco');
+  const lbl = document.getElementById('loginStageLabel');
+  const steps = document.getElementById('loginSteps');
+  const pass = document.getElementById('loginPassLabel');
+  const btn = document.getElementById('loginSubmitBtn');
+  const foot = document.getElementById('loginFootHint');
+  if(band) band.style.display = stage ? '' : 'none';
+  if(steps){
+    steps.style.display = stage ? '' : 'none';
+    steps.querySelectorAll('.login-step').forEach(el=>{
+      const n = el.dataset.step;
+      el.classList.toggle('active', (stage === 'device' && n === '1') || (stage === 'employee' && n === '2'));
+      el.classList.toggle('done', stage === 'employee' && n === '1');
+      const i = el.querySelector('i'); if(i) i.textContent = (stage === 'employee' && n === '1') ? '\u2713' : n;
+    });
+  }
+  if(stage === 'device'){
+    if(ico) ico.textContent = '\u{1F3E2}';
+    if(lbl) lbl.textContent = 'เชื่อมอุปกรณ์นี้กับบริษัท';
+    if(pass){ pass.removeAttribute('data-i18n'); pass.textContent = 'รหัสผ่านบริษัท'; }
+    if(btn){ btn.removeAttribute('data-i18n'); btn.textContent = 'เชื่อมต่ออุปกรณ์'; }
+    if(foot) foot.textContent = 'ทำครั้งเดียวต่อเครื่อง — ขอโค้ดบริษัทได้จากเจ้าของร้าน';
+  }else if(stage === 'employee'){
+    if(ico) ico.textContent = '\u2705';
+    if(lbl) lbl.textContent = 'อุปกรณ์นี้เชื่อมกับบริษัทแล้ว';
+    if(pass){ pass.removeAttribute('data-i18n'); pass.textContent = 'รหัสผ่าน'; }
+    if(btn){ btn.removeAttribute('data-i18n'); btn.textContent = 'เข้าสู่ระบบ'; }
+    if(foot) foot.textContent = 'ล็อกอินด้วย ID พนักงานของคุณ';
+  }
+}
+
 // Stage 1: unlock the browser against Firebase.
 function stageDeviceUnlock(auth, signInWithEmailAndPassword){
   const form   = document.getElementById('loginForm');
@@ -191,8 +252,9 @@ function stageDeviceUnlock(auth, signInWithEmailAndPassword){
   const showErr = (msg)=>{ if(errEl){ errEl.textContent = msg; errEl.style.display = 'block'; } };
 
   showLogin();
-  setLoginText('รบกวนกรอกโค้ดบริษัท', 'โค้ดบริษัท');
-  loginHint('กรอกโค้ดบริษัทเพื่อเชื่อมอุปกรณ์นี้กับฐานข้อมูล — ทำครั้งเดียวต่อเครื่อง');
+  setLoginStage('device');
+  setLoginText('กรอกโค้ดบริษัท', 'โค้ดบริษัท');
+  loginHint('');
   if(userEl){ userEl.type = 'text'; userEl.placeholder = 'โค้ดบริษัท'; }
   if(devBtn) devBtn.style.display = 'none';       // no local dev bypass when the DB is live
 
@@ -206,14 +268,17 @@ function stageDeviceUnlock(auth, signInWithEmailAndPassword){
       const password = passEl ? passEl.value : '';
       if(!email || !password){ showErr('กรุณากรอกโค้ดบริษัทและรหัสผ่านให้ครบค่ะ'); return; }
       const btn = form.querySelector('[type="submit"]');
-      if(btn) btn.disabled = true;
+      const label = btn ? btn.textContent : '';
+      if(btn){ btn.disabled = true; btn.textContent = 'กำลังตรวจสอบ…'; }
       try{
         await signInWithEmailAndPassword(auth, email, password);
         if(passEl) passEl.value = '';
+        if(userEl) userEl.value = '';
+        // onAuthStateChanged takes over from here and shows the loading screen.
       }catch(err){
         showErr(authErrorMessage(err && err.code));
       }finally{
-        if(btn) btn.disabled = false;
+        if(btn){ btn.disabled = false; btn.textContent = label; }
       }
     });
   }
@@ -225,12 +290,13 @@ function stageEmployeeGate(signOut, auth, user){
   const userEl = document.getElementById('loginUsername');
   window.__fbStage = 'employee';
   if(userEl){ userEl.type = 'text'; userEl.placeholder = 'username'; }
+  setLoginStage('employee');
   setLoginText('เข้าสู่ระบบพนักงาน', 'ID พนักงาน');
   // No Dev button on this screen anymore — a non-dev Firebase account can
   // never become Developer, so there is nothing to show here.
   const devBtn = document.getElementById('loginDevBtn');
   if(devBtn) devBtn.remove();
-  loginHint('อุปกรณ์นี้เชื่อมกับฐานข้อมูลแล้ว — เข้าสู่ระบบด้วย ID พนักงานของคุณ');
+  loginHint('');
 
   if(!employeeGateWired){
     employeeGateWired = true;
@@ -244,7 +310,7 @@ function stageEmployeeGate(signOut, auth, user){
       link.id = 'loginSignOutDevice';
       link.className = 'btn btn-ghost';
       link.style.cssText = 'width:100%; margin-top:8px; font-size:12px; opacity:0.8;';
-      link.textContent = 'ออกจากอุปกรณ์นี้ (Firebase)';
+      link.textContent = 'ยกเลิกการเชื่อมอุปกรณ์นี้ (เปลี่ยนบริษัท)';
       link.addEventListener('click', async ()=>{
         try{ await signOut(auth); }catch(e){ console.error('signOut failed', e); }
         location.reload();
@@ -278,12 +344,15 @@ async function initFirebaseAuth(){
     return;
   }
 
+  // Same SDK build firebase-config.js already loaded (it exposes it) — importing
+  // a different version here used to download the whole auth SDK a second time.
   const { signInWithEmailAndPassword, onAuthStateChanged, signOut } =
-    await import("https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js");
+    window.__fbAuthMod || await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js");
 
   onAuthStateChanged(auth, async (user)=>{
     if(user){
-      if(window.__hydrateStore) await window.__hydrateStore();   // rules need the session
+      showLoading('กำลังโหลดข้อมูลบริษัท…', '');
+      if(window.__hydrateStore) await window.__hydrateStore(loadingProgress);   // rules need the session
       // Developer is unlocked ONLY when the unlocking email is the dev's.
       // The shared/central account (and any other) falls through to the
       // ordinary employee gate — no Dev button, no Dev role.

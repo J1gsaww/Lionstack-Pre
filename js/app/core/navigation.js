@@ -40,7 +40,7 @@ function roomNavKey(view){
   return view.type;
 }
 
-// ---- Store-only mode (Phase 3): present just the Simple Store + Storefront
+// ---- Store-only mode (Phase 3): present just the Simple Store
 // modules. The kanban (home / rooms / main calendar / global notes / notify) is
 // kept in code but hidden from the sidebar and made unreachable via navigateTo.
 // Flip STORE_ONLY to false to bring the full Base App back. ----
@@ -97,7 +97,7 @@ function renderSidebar(){
     ? `<div class="nav-item ${activeKey===navKey?'active':''}" data-nav="${navKey}"><span class="dot"></span><span class="label">${t(labelKey)}</span></div>`
     : '';
   const NAV_CATS = [
-    ['nav.cat.inventory', [ modItem('stock'), modItem('sell'), modItem('delivery'), modItem('storefront') ]],
+    ['nav.cat.inventory', [ modItem('stock'), modItem('sell'), modItem('delivery') ]],
     ['nav.cat.accounting',[ modItem('revenueAcct'), modItem('cogsInventory'), modItem('expenseAp'), modItem('financialReport') ]],
     ['nav.cat.hr',        [ modItem('payroll'), modItem('empCalendar') ]],
     ['nav.cat.org',       [ modItem('businessProfile'), modItem('employeeMgmt') ]],
@@ -137,7 +137,7 @@ function renderSidebar(){
 }
 
 // Sidebar order, used to pick a landing page when the requested one is missing.
-const NAV_MODULE_ORDER = ['importExport','stock','sell','delivery','storefront','revenueAcct','cogsInventory','expenseAp','financialReport','payroll','empCalendar','businessProfile','employeeMgmt','customerDoc','commissionSetting','accountingSetting'];
+const NAV_MODULE_ORDER = ['importExport','stock','sell','delivery','revenueAcct','cogsInventory','expenseAp','financialReport','payroll','empCalendar','businessProfile','employeeMgmt','customerDoc','commissionSetting','accountingSetting'];
 function firstAvailableModule(){
   for(const id of NAV_MODULE_ORDER){
     const m = getModule(id);

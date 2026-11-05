@@ -155,3 +155,60 @@ function onJigsawRootShown(){
 }
 window.onJigsawRootShown = onJigsawRootShown;
 
+
+/* ---- live sync: another device changed data ----
+   firebase-config.js fires 'store-remote-change' { keys } after applying a
+   change from another device to the cache. Every module that wants it gets
+   onRemoteChange(keys) to re-read its arrays, then the page on screen is
+   redrawn. If someone is mid-edit (a form or popup is open, or they are typing
+   in a box) the redraw waits until they're done, so nothing they typed is
+   lost; a small note says new data is waiting. */
+let __remotePending = null;          // Set of keys not yet applied to the screen
+let __remoteTimer = null;
+function __screenBusy(){
+  if(document.querySelector('.art-modal-overlay, .modal-overlay.show')) return true;
+  if(document.querySelector('#oSave, #pSave')) return true;           // bill / product form open
+  const a = document.activeElement;
+  if(a && a.closest && a.closest('.main') && /^(INPUT|TEXTAREA)$/.test(a.tagName)
+     && !/^(checkbox|radio|button|submit|date|month)$/i.test(a.type || '')) return true;
+  return false;
+}
+function __remoteNote(show){
+  let el = document.getElementById('remoteNote');
+  if(!show){ if(el) el.remove(); return; }
+  if(el) return;
+  el = document.createElement('div');
+  el.id = 'remoteNote';
+  el.className = 'remote-note';
+  el.textContent = (typeof currentLang !== 'undefined' && currentLang === 'en')
+    ? 'New data from another device — the page will update when you finish'
+    : 'มีข้อมูลใหม่จากเครื่องอื่น — หน้าจอจะอัปเดตเมื่อกรอกเสร็จ';
+  document.body.appendChild(el);
+}
+async function __applyRemoteToScreen(){
+  __remoteTimer = null;
+  if(!__remotePending) return;
+  if(__screenBusy()){ __remoteNote(true); __remoteTimer = setTimeout(__applyRemoteToScreen, 1500); return; }
+  const keys = [...__remotePending]; __remotePending = null;
+  __remoteNote(false);
+  for(const m of MODULES){
+    if(typeof m.onRemoteChange !== 'function') continue;
+    try{ await m.onRemoteChange(keys); }catch(e){ logAppError('live sync reload failed: ' + m.id, e); }
+  }
+  try{
+    const main = document.querySelector('.main');
+    const top = main ? main.scrollTop : 0;
+    if(typeof currentView !== 'undefined' && currentView && currentView.type === 'module'){
+      const m = getModule(currentView.moduleId);
+      if(m && typeof m.render === 'function') m.render();
+    }
+    if(main) main.scrollTop = top;
+    if(typeof renderSidebar === 'function') renderSidebar();
+  }catch(e){ logAppError('live sync redraw failed', e); }
+}
+window.addEventListener('store-remote-change', (e)=>{
+  const keys = (e && e.detail && e.detail.keys) || [];
+  if(!__remotePending) __remotePending = new Set();
+  keys.forEach(k=> __remotePending.add(k));
+  if(!__remoteTimer) __remoteTimer = setTimeout(__applyRemoteToScreen, 50);
+});

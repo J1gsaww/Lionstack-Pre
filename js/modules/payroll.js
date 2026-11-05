@@ -587,6 +587,7 @@
     navLabel: { th: 'เงินเดือน', en: 'Payroll' },
     pageId: 'page-payroll',
     async onInit(){ await loadAll(); },
+    async onRemoteChange(){ await loadAll(); },   // live sync: re-read from the updated cache
     async mount(container){
       if(!components.length) await loadAll();
       container.innerHTML = `

@@ -67,7 +67,6 @@
   const K_DELPRODUCTS = 'mod_store_deleted_products';
   const K_OPEX     = 'mod_store_opex';   // day-to-day running costs (rent, ads, fees...)
   const K_OPEXLOG  = 'mod_store_opexlog';
-  const K_STOCKPUB = 'mod_store_stockpublic'; // quantities only — safe for the public shop (no costs, no orders)
   const K_CONFIG   = 'mod_store_config';   // { expenseTags, revenueTags, orderStatuses, invoiceStatuses }
   const K_PROMOS   = 'mod_store_promotions'; // [{ id, name, effectiveDate, endDate, items:[{productId,percent}], closed, endedAck }]
   const K_ORDERLOG   = 'mod_store_orderlog';
@@ -179,6 +178,11 @@
   let productLog = [];
   let _ehDetail = null;
   let prodEditingId = null;
+  // Products list view state — kept at module level so the chosen category and
+  // page survive a re-render (edit, delete, restock).
+  let prodFilterCat = '';          // '' = all products
+  let prodPage = 1;
+  const PROD_PAGE_SIZE = 20;
   let prodImageData = null;
   let prodBillData = null;
   // Product status is DERIVED from stock, never chosen by hand.
@@ -379,6 +383,28 @@
           };
         })
       );
+    }
+  }
+
+  // Live sync: another device changed some keys — re-read our arrays from the
+  // (already updated) cache. READ ONLY on purpose: none of the boot-time steps
+  // that write (migrations, syncDeliveries, promo checks) run here, otherwise
+  // two open devices could keep re-writing each other's changes.
+  // All store modules share this data, so one reload per event is enough.
+  let _lastRemoteKeys = null;
+  async function reloadFromRemote(keys){
+    if(!_storeLoaded || keys === _lastRemoteKeys) return;
+    _lastRemoteKeys = keys;
+    const map = {
+      [K_EXPENSES]:  v=> expenses = v,  [K_ORDERS]:   v=> orders = v,   [K_PRODUCTS]: v=> products = v,
+      [K_STOCKLOG]:  v=> stockLog = v,  [K_LOTS]:     v=> lots = v,     [K_DELIVERIES]: v=> deliveries = v,
+      [K_PROMOS]:    v=> promotions = v, [K_ORDERLOG]: v=> orderLog = v, [K_OPEX]:     v=> opex = v,
+      [K_OPEXLOG]:   v=> opexLog = v,   [K_DELORDERS]: v=> deletedOrders = v, [K_DELPRODUCTS]: v=> deletedProducts = v,
+      [K_PRODUCTLOG]: v=> productLog = v
+    };
+    for(const k of keys){
+      if(map[k]){ map[k](await window.Store.list(k)); if(window.__markItemsSeen) window.__markItemsSeen(k); }
+      else if(k === K_CONFIG) await loadConfig();
     }
   }
 
@@ -1088,6 +1114,7 @@
       subpages: cfg.subpages,      // read by the sidebar to decide visibility
       pageId: 'page-' + cfg.id,
       async onInit(){ await ensureLoaded(); },
+      async onRemoteChange(keys){ await reloadFromRemote(keys); },
       mount(container){
         const lang = (window.appLang && window.appLang()) || 'th';
         container.innerHTML = `
@@ -1329,11 +1356,49 @@
     saveConfig();
     return n;
   }
-  function generateInvoiceNumber(dateStr, excludeId){
+  // Bill number = <prefix>-<date code>-<NNN>. NNN is 1 + the highest number
+  // already used that day, read from the LIVE bill list in the store cache
+  // (kept current by live sync, even while this form is open) — not only
+  // from the shared counter, which two devices can both bump to the same value.
+  // peek=true (the preview in the form) shows the next number without using it up.
+  // Final number at save time. In Firebase mode it comes from the server
+  // counter (window.__reserveSeq, a transaction) — the only way two devices
+  // saving in the same second can't collide. If the server can't be reached or
+  // the rules don't allow `counters` yet, it falls back to the local method so
+  // a bill is never blocked from saving.
+  async function reserveInvoiceNumber(dateStr, excludeId){
+    if(typeof window.__reserveSeq !== 'function' || window.__ssBackend !== 'firestore') return generateInvoiceNumber(dateStr, excludeId);
+    const [y,m,d] = dateStr.split('-').map(Number);
+    const head = `${(config.prefixes && config.prefixes.order) || 'ATSC'}-${dateHashCode(d, m, y)}-`;
+    const peekN = parseInt(generateInvoiceNumber(dateStr, excludeId, true).slice(head.length), 10) || 1;
+    try{
+      const n = await window.__reserveSeq('order_' + head.slice(0, -1), peekN - 1);
+      return `${head}${String(n).padStart(3,'0')}`;
+    }catch(e){
+      console.warn('[store] server counter unavailable — using the local bill number', e);
+      if(!reserveInvoiceNumber._warned && typeof logAppError === 'function'){ reserveInvoiceNumber._warned = true; logAppError('ตัวนับเลขบิลฝั่งเซิร์ฟเวอร์ใช้ไม่ได้ (ตรวจ Firestore rules ของ counters) — ใช้เลขจากเครื่องแทน', e); }
+      return generateInvoiceNumber(dateStr, excludeId);
+    }
+  }
+  function generateInvoiceNumber(dateStr, excludeId, peek){
     const [y,m,d] = dateStr.split('-').map(Number);
     const code = dateHashCode(d, m, y);
     const prefix = (config.prefixes && config.prefixes.order) || 'ATSC';
-    return `${prefix}-${code}-${String(nextSeq('order', dateStr)).padStart(3,'0')}`;
+    const head = `${prefix}-${code}-`;
+    let live = orders;
+    try{ const raw = window.Store.getRaw(K_ORDERS); if(raw) live = JSON.parse(raw) || orders; }catch(e){}
+    let maxN = 0;
+    live.concat(orders).forEach(o=>{
+      if(!o || o.id === excludeId || typeof o.invoiceNumber !== 'string' || o.invoiceNumber.indexOf(head) !== 0) return;
+      const n = parseInt(o.invoiceNumber.slice(head.length), 10);
+      if(n > maxN) maxN = n;
+    });
+    if(!config.counters) config.counters = {};
+    const cur = config.counters.order;
+    const counterN = (cur && cur.date === dateStr) ? (cur.n || 0) : 0;
+    const n = Math.max(maxN, counterN) + 1;
+    if(!peek){ config.counters.order = { date: dateStr, n }; saveConfig(); }
+    return `${head}${String(n).padStart(3,'0')}`;
   }
   // Cost of goods sold for one order = what the allocated cost lots actually cost.
   // Commission rate for a product category (percent).
@@ -1358,12 +1423,17 @@
       const net = gross - dAmt(gross, it.discount, it.discountType);
       const cost = (it.costAllocation || []).reduce((x,a)=> x + (Number(a.cost)||0) * (a.qty||0), 0);
       const prod = products.find(x=> x.id === it.productId);
-      return { net, cost, cat: (prod && prod.productType) || '' };
+      return { net, cost, cat: (prod && prod.productType) || '', repair: it.kind === 'repair' };
     });
+    if(lines.length && lines.every(l=> l.repair)) return 0;   // repair-only bill: no commission at all
     const totalNet = lines.reduce((sm,l)=> sm + l.net, 0);
     let comm = 0, profitBase = 0;
     lines.forEach(l=>{
       const share = totalNet > 0 ? (l.net / totalNet) : 0;
+      // Repair charges earn no commission; parts on the same bill still do.
+      // The repair line still takes its share of the bill's fees, so the parts
+      // are not charged for fees that belong to the repair.
+      if(l.repair) return;
       const profit = l.net - l.cost - deductions * share;
       if(profit <= 0) return;
       profitBase += profit;
@@ -2264,7 +2334,7 @@
     await saveOpex();
   };
   function openOpexProof(entry, onDone){
-    let list = Array.isArray(entry.proofs) ? entry.proofs.slice(0,5) : [];
+    let list = Array.isArray(entry.proofs) ? entry.proofs.slice() : [];
     const ov = document.createElement('div');
     ov.className = 'art-modal-overlay show';
     ov.innerHTML = `<div class="art-modal" style="max-width:560px;">
@@ -2280,15 +2350,13 @@
     const grid = ov.querySelector('#oxGrid');
     function draw(){
       grid.innerHTML = list.map((fl,i)=> `<span class="pi-thumb"><img src="${esc(fl.src)}" alt=""><button type="button" class="pi-rm" data-j="${i}">\u2715</button></span>`).join('')
-        + (list.length < 5 ? `<label class="pi-add"><input type="file" class="ox-inp-file" accept="image/*" multiple><span>+</span></label>` : '');
+        + `<label class="pi-add"><input type="file" class="ox-inp-file" accept="image/*" multiple><span>+</span></label>`;
       grid.querySelectorAll('.pi-rm').forEach(b=> b.addEventListener('click', ()=>{ list.splice(+b.dataset.j, 1); draw(); }));
       const inp = grid.querySelector('.ox-inp-file');
       if(inp) inp.addEventListener('change', (ev)=>{
         Array.from(ev.target.files || []).forEach(file=>{
-          if(list.length >= 5) return;
-          if(file.size > 256*1024){ alert(T('bill.tooBig')); return; }
           const rd = new FileReader();
-          rd.onload = ()=>{ if(list.length < 5){ list.push({ src: rd.result, name: file.name || '' }); draw(); } };
+          rd.onload = ()=>{ list.push({ src: rd.result, name: file.name || '' }); draw(); };
           rd.readAsDataURL(file);
         });
       });
@@ -2299,7 +2367,7 @@
     ov.addEventListener('click', ev=>{ if(ev.target === ov) close(); });
     ov.querySelector('#oxPfCancel').addEventListener('click', close);
     ov.querySelector('#oxPfOk').addEventListener('click', async ()=>{
-      entry.proofs = list.slice(0,5);
+      entry.proofs = list.slice();
       entry.updatedBy = sellerNameOf();
       entry.updatedAt = new Date().toISOString();
       await saveOpex();
@@ -2507,15 +2575,13 @@
     const grid = ov.querySelector('#amGrid');
     function draw(){
       grid.innerHTML = list.map((fl,i)=> `<span class="pi-thumb"><img src="${esc(fl.src)}" alt=""><button type="button" class="pi-rm" data-j="${i}">\u2715</button></span>`).join('')
-        + (list.length < 5 ? `<label class="pi-add"><input type="file" class="am-inp" accept="image/*" multiple><span>+</span></label>` : '');
+        + `<label class="pi-add"><input type="file" class="am-inp" accept="image/*" multiple><span>+</span></label>`;
       grid.querySelectorAll('.pi-rm').forEach(b=> b.addEventListener('click', ()=>{ list.splice(+b.dataset.j, 1); draw(); }));
       const inp = grid.querySelector('.am-inp');
       if(inp) inp.addEventListener('change', (ev)=>{
         Array.from(ev.target.files || []).forEach(file=>{
-          if(list.length >= 5) return;
-          if(file.size > 256*1024){ alert(T('bill.tooBig')); return; }
           const rd = new FileReader();
-          rd.onload = ()=>{ if(list.length < 5){ list.push({ src: rd.result, name: file.name || '' }); draw(); } };
+          rd.onload = ()=>{ list.push({ src: rd.result, name: file.name || '' }); draw(); };
           rd.readAsDataURL(file);
         });
       });
@@ -2528,7 +2594,7 @@
       const who = sellerNameOf(), when = new Date().toISOString();
       rows.forEach(e=>{
         const cur = apOf(e);
-        const proofs = list.length ? cur.proofs.concat(list).slice(0, 5) : cur.proofs;
+        const proofs = list.length ? cur.proofs.concat(list) : cur.proofs;
         apTouch(e, {
           status: 'paid', paid: apAmountOf(e), proofs,
           statusBy: who, statusAt: when,
@@ -2541,7 +2607,7 @@
   }
   // Draft-only proof picker (max 5) — nothing is stored until the page is saved.
   function openApProofEditor(entry, onDone){
-    let list = apOf(entry).proofs.slice(0, 5);
+    let list = apOf(entry).proofs.slice();
     const ov = document.createElement('div');
     ov.className = 'art-modal-overlay show';
     ov.innerHTML = `<div class="art-modal" style="max-width:560px;">
@@ -2557,15 +2623,13 @@
     const grid = ov.querySelector('#apGrid');
     function draw(){
       grid.innerHTML = list.map((fl,i)=> `<span class="pi-thumb"><img src="${esc(fl.src)}" alt=""><button type="button" class="pi-rm" data-j="${i}">\u2715</button></span>`).join('')
-        + (list.length < 5 ? `<label class="pi-add"><input type="file" class="ap-inp" accept="image/*" multiple><span>+</span></label>` : '');
+        + `<label class="pi-add"><input type="file" class="ap-inp" accept="image/*" multiple><span>+</span></label>`;
       grid.querySelectorAll('.pi-rm').forEach(b=> b.addEventListener('click', ()=>{ list.splice(+b.dataset.j, 1); draw(); }));
       const inp = grid.querySelector('.ap-inp');
       if(inp) inp.addEventListener('change', (ev)=>{
         Array.from(ev.target.files || []).forEach(file=>{
-          if(list.length >= 5) return;
-          if(file.size > 256*1024){ alert(T('bill.tooBig')); return; }
           const rd = new FileReader();
-          rd.onload = ()=>{ if(list.length < 5){ list.push({ src: rd.result, name: file.name || '' }); draw(); } };
+          rd.onload = ()=>{ list.push({ src: rd.result, name: file.name || '' }); draw(); };
           rd.readAsDataURL(file);
         });
       });
@@ -2576,7 +2640,7 @@
     ov.addEventListener('click', ev=>{ if(ev.target === ov) close(); });
     ov.querySelector('#apPfCancel').addEventListener('click', close);
     ov.querySelector('#apPfOk').addEventListener('click', ()=>{
-      apTouch(entry, { proofs: list.slice(0,5) });
+      apTouch(entry, { proofs: list.slice() });
       close();
       if(typeof onDone === 'function') onDone();
     });
@@ -2851,7 +2915,7 @@
     rows.forEach(r=>{
       (r.o.items||[]).forEach(it=>{
         const alloc = it.costAllocation || [];
-        if(!alloc.length && (it.qty||0) > 0) missing++;
+        if(!alloc.length && (it.qty||0) > 0 && it.kind !== 'repair') missing++;
         const prod = products.find(x=> x.id === it.productId);
         const cat = (prod && prod.productType) || T('sum.uncategorised');
         alloc.forEach(a=>{
@@ -3768,14 +3832,52 @@
         </select>
       </div>`;
     }
+    // Apply a picker result to line i: a catalog product, or a repair charge.
+    function applyPick(i, res){
+      const it = items[i];
+      it.colorId = null; it.colorName = '';
+      it.costAllocation = [];   // product changed → clear cost-lot allocation
+      if(res && res.kind === 'repair'){
+        it.kind = 'repair'; it.productId = null;
+        it.productName = res.desc || '';
+        it.price = Number(res.price) || 0;
+        it.salePercent = 0;
+        return;
+      }
+      const p = res && products.find(x=> x.id === res.productId);
+      delete it.kind;
+      if(!p){ it.productId = null; it.productName = ''; it.salePercent = 0; return; }
+      it.productId = p.id; it.productName = p.name;
+      const pct = activePromoPercent(p.id);
+      if(pct > 0){
+        // Auto-apply the active promotion: fill the discounted unit price and
+        // stamp the % on the line so the bill shows a tag. Price stays
+        // editable afterward for manual tweaks.
+        it.salePercent = pct;
+        it.price = Math.round(p.price * (1 - pct/100) * 100) / 100;
+      }else{
+        it.salePercent = 0;
+        it.price = p.price;
+      }
+    }
     function drawItems(){
-      const opts = (id)=> products.map(p=> `<option value="${p.id}" ${p.id===id?'selected':''}>${esc(p.name)}${p.sku?` (${esc(p.sku)})`:''} · ฿${fmt(p.price)}</option>`).join('');
+      // Product cell: a button that opens the picker popup. A repair line shows
+      // its own free-text description instead (with a badge to re-pick).
+      const prodCell = (it)=>{
+        if(it.kind === 'repair'){
+          return `<div class="art-item-repair">
+            <button type="button" class="art-item-pick art-item-repair-badge" title="${esc(T('pp.repair'))} · ${esc(T('pp.change'))}">🔧</button>
+            <input type="text" class="art-item-repair-desc" data-f="productName" value="${esc(it.productName||'')}" placeholder="${esc(T('pp.repairDescPh'))}">
+          </div>`;
+        }
+        const p = it.productId ? products.find(x=> x.id === it.productId) : null;
+        if(!p) return `<button type="button" class="art-item-pick art-item-pick-empty">${esc(T('rev.pickProduct'))}<span class="art-item-pick-ico">▾</span></button>`;
+        const th = productThumb(p);
+        return `<button type="button" class="art-item-pick" title="${esc(p.name)}${p.sku?' ('+esc(p.sku)+')':''} · ${esc(T('pp.change'))}">${th ? `<img src="${esc(th)}" alt="">` : `<span class="art-item-pick-noimg">🏷️</span>`}<span class="art-item-pick-name">${esc(p.name)}${p.sku?` <i>${esc(p.sku)}</i>`:''}</span><span class="art-item-pick-ico">▾</span></button>`;
+      };
       g('oItems').innerHTML = items.map((it,i)=> `
         <div class="art-item-row" data-i="${i}">
-          <select class="art-item-select" data-f="productId">
-            <option value="">${esc(T('rev.pickProduct'))}</option>
-            ${opts(it.productId)}
-          </select>
+          ${prodCell(it)}
           <input type="number" class="art-item-qty" data-f="qty" value="${it.qty}" step="1" min="1">
           <input type="number" class="art-item-price" data-f="price" value="${it.price}" step="0.01" placeholder="${esc(T('rev.itemPrice'))}">
           <input type="number" class="art-item-disc" data-f="discount" value="${it.discount||0}" step="0.01" min="0">
@@ -3785,28 +3887,13 @@
         </div>${colorHtml(it,i)}${allocHtml(it,i)}`).join('');
       g('oItems').querySelectorAll('.art-item-row').forEach(r=>{
         const i = parseInt(r.dataset.i,10);
-        // Product select: pick from catalog → fills productId, name, price.
-        r.querySelector('.art-item-select').addEventListener('change', (e)=>{
-          const p = products.find(x=> x.id === e.target.value);
-          if(p){
-            items[i].productId = p.id; items[i].productName = p.name;
-            const pct = activePromoPercent(p.id);
-            if(pct > 0){
-              // Auto-apply the active promotion: fill the discounted unit price and
-              // stamp the % on the line so the bill shows a tag. Price stays
-              // editable afterward for manual tweaks.
-              items[i].salePercent = pct;
-              items[i].price = Math.round(p.price * (1 - pct/100) * 100) / 100;
-            }else{
-              items[i].salePercent = 0;
-              items[i].price = p.price;
-            }
-            items[i].colorId = null; items[i].colorName = '';
-          }
-          else { items[i].productId = null; items[i].productName = ''; items[i].salePercent = 0; items[i].colorId = null; items[i].colorName = ''; }
-          items[i].costAllocation = [];   // product changed → clear cost-lot allocation
-          drawItems(); updatePreview();
+        // Product cell: opens the picker popup → fills productId, name, price
+        // (or turns the line into a free-text repair charge).
+        r.querySelector('.art-item-pick').addEventListener('click', ()=>{
+          openProductPicker({ currentId: items[i].productId, onPick: (res)=>{ applyPick(i, res); drawItems(); updatePreview(); } });
         });
+        const rd = r.querySelector('.art-item-repair-desc');
+        if(rd) rd.addEventListener('input', ()=>{ items[i].productName = rd.value; });
         r.querySelectorAll('[data-f="discount"]').forEach(inp=> inp.addEventListener('input', ()=>{ items[i].discount = parseFloat(inp.value)||0; updatePreview(); }));
         r.querySelectorAll('[data-f="discountType"]').forEach(sel=> sel.addEventListener('change', ()=>{ items[i].discountType = sel.value; updatePreview(); }));
         // qty / price: update state + preview (price stays editable for special deals).
@@ -3923,24 +4010,29 @@
       const date = g('oDate').value;
       if(!date){ g('ordInvPreview').textContent='-'; return; }
       if(ordEditingId && row && date === row.date){ g('ordInvPreview').textContent = row.invoiceNumber || '-'; }
-      else g('ordInvPreview').textContent = generateInvoiceNumber(date, ordEditingId);
+      else g('ordInvPreview').textContent = generateInvoiceNumber(date, ordEditingId, true);
     }
     drawItems(); fillShipList(); updatePreview(); updateInv();
-    g('oAddItem').addEventListener('click', ()=>{ items.push({ productName:'', qty:1, price:0, colorId:null, colorName:'', costAllocation:[] }); drawItems(); fillShipList(); updatePreview(); });
+    g('oAddItem').addEventListener('click', ()=>{
+      openProductPicker({ onPick: (res)=>{
+        let i = items.findIndex(it=> !it.productId && it.kind !== 'repair' && !(it.productName||'').trim());
+        if(i < 0){ items.push({ productName:'', qty:1, price:0, colorId:null, colorName:'', costAllocation:[] }); i = items.length - 1; }
+        applyPick(i, res);
+        drawItems(); fillShipList(); updatePreview();
+      } });
+    });
     // ---- payment slips: up to five images per bill ----
-    let payProofs = (row && Array.isArray(row.paymentProofs)) ? row.paymentProofs.slice(0,5) : [];
+    let payProofs = (row && Array.isArray(row.paymentProofs)) ? row.paymentProofs.slice() : [];
     function drawPayProofs(){
       const wrap = g('oPayProofs'); if(!wrap) return;
       wrap.innerHTML = payProofs.map((f,i)=> `<span class="pi-thumb"><img src="${esc(f.src)}" alt=""><button type="button" class="pi-rm" data-j="${i}" title="${esc(T('delete'))}">\u2715</button></span>`).join('')
-        + (payProofs.length < 5 ? `<label class="pi-add"><input type="file" id="oProofInput" accept="image/*" multiple><span>+</span></label>` : '');
+        + `<label class="pi-add"><input type="file" id="oProofInput" accept="image/*" multiple><span>+</span></label>`;
       wrap.querySelectorAll('.pi-rm').forEach(b=> b.addEventListener('click', (e)=>{ e.preventDefault(); payProofs.splice(+b.dataset.j, 1); drawPayProofs(); }));
       const inp = wrap.querySelector('#oProofInput');
       if(inp) inp.addEventListener('change', (e)=>{
         Array.from(e.target.files || []).forEach(file=>{
-          if(payProofs.length >= 5) return;
-          if(file.size > 256*1024){ alert(T('bill.tooBig')); return; }
           const rd = new FileReader();
-          rd.onload = ()=>{ if(payProofs.length < 5){ payProofs.push({ src: rd.result, name: file.name || '' }); drawPayProofs(); } };
+          rd.onload = ()=>{ payProofs.push({ src: rd.result, name: file.name || '' }); drawPayProofs(); };
           rd.readAsDataURL(file);
         });
       });
@@ -3983,7 +4075,6 @@
       g('oSignClear').addEventListener('click', ()=>{ signData = null; signDirty = false; ctx.clearRect(0,0,cv.width,cv.height); });
       g('oSignFile').addEventListener('change', (e)=>{
         const file = e.target.files[0]; if(!file) return;
-        if(file.size > 256*1024){ alert(T('bill.tooBig')); e.target.value=''; return; }
         const rd = new FileReader();
         rd.onload = ()=>{ signData = rd.result; signDirty = true; paint(); };
         rd.readAsDataURL(file);
@@ -4065,7 +4156,7 @@
           ${deliveryProof ? `<button type="button" class="acc-icon" id="oProofClear" title="${esc(T('delete'))}">\u2715</button>` : ''}
         </div></div>`;
       const fi=g('oProofFile');
-      if(fi) fi.addEventListener('change', (e)=>{ const f=e.target.files[0]; if(!f) return; if(f.size>256*1024){ alert(T('bill.tooBig')); e.target.value=''; return; } const r=new FileReader(); r.onload=()=>{ deliveryProof=r.result; renderProof(); }; r.readAsDataURL(f); });
+      if(fi) fi.addEventListener('change', (e)=>{ const f=e.target.files[0]; if(!f) return; const r=new FileReader(); r.onload=()=>{ deliveryProof=r.result; renderProof(); }; r.readAsDataURL(f); });
       const clr=g('oProofClear'); if(clr) clr.addEventListener('click', ()=>{ deliveryProof=null; renderProof(); });
     }
     const _dm=g('oDeliveryMethod');
@@ -4088,15 +4179,17 @@
         str: `${addr.line1} ต.${_subd[2]} อ.${_dist[2]} จ.${_prov[1]} ${addr.postal}`.trim(),
         parts: { line1:addr.line1, provinceCode:addr.pCode, provinceName:_prov[1], districtCode:addr.dCode, districtName:_dist[2], subdistrictCode:addr.sCode, subdistrictName:_subd[2], postalCode:addr.postal }
       };
-      const cleanItems = items.filter(it=> it.productId || it.productName.trim());
+      const cleanItems = items.filter(it=> it.productId || it.kind === 'repair' || (it.productName||'').trim());
       if(cleanItems.length === 0){ alert(T('rev.errItems')); return; }
-      if(cleanItems.some(it=> !it.productId)){ alert(T('rev.errPickProduct')); return; }
+      if(cleanItems.some(it=> it.kind === 'repair' && !(it.productName||'').trim())){ alert(T('pp.errRepairDesc')); return; }
+      if(cleanItems.some(it=> !it.productId && it.kind !== 'repair')){ alert(T('rev.errPickProduct')); return; }
       if(!signData){ alert(T('sell.errSign')); return; }
       const _noColor = cleanItems.find(it=> colorsOf(it.productId).length && !it.colorId);
       if(_noColor){ alert(T('rev.errPickColor').replace('{p}', _noColor.productName||'')); return; }
       // cost-lot allocation: each item must be fully allocated; no lot over-drawn.
       const perLot = {};
       for(const it of cleanItems){
+        if(it.kind === 'repair'){ it.costAllocation = []; it.productName = it.productName.trim(); continue; }   // a repair charge has no stock lot
         it.costAllocation = (it.costAllocation||[]).filter(a=> a.lotId && a.qty>0);
         const sm = it.costAllocation.reduce((x,a)=> x+(a.qty||0), 0);
         if(sm !== (it.qty||0)){ alert(T('alloc.errSum').replace('{p}', it.productName).replace('{a}', sm).replace('{q}', it.qty||0)); return; }
@@ -4119,7 +4212,7 @@
         remark: g('oRemark') ? g('oRemark').value.trim() : '',
         vatable: g('oVat') ? g('oVat').checked : false,
         docSplit: oSplitMode,
-        paymentProofs: payProofs.slice(0,5),
+        paymentProofs: payProofs.slice(),
         seller: (row && row.seller) ? row.seller : sellerNameOf(),
         sellerSignature: signData || null,
         platformFee: Math.abs(parseFloat(g('oFeePct').value)||0),
@@ -4131,8 +4224,11 @@
         note: g('oNote').value.trim(),
         tag: g('oTag').value, orderStatus: g('oOs').value, invoiceStatus: g('oIs').value
       };
-      if(ordEditingId && row && date === row.date){ data.invoiceNumber = row.invoiceNumber || generateInvoiceNumber(date, ordEditingId); }
-      else data.invoiceNumber = generateInvoiceNumber(date, ordEditingId);
+      const _saveBtn = g('oSave'); if(_saveBtn) _saveBtn.disabled = true;   // no double-click while the number is reserved
+      try{
+        if(ordEditingId && row && date === row.date && row.invoiceNumber){ data.invoiceNumber = row.invoiceNumber; }
+        else data.invoiceNumber = await reserveInvoiceNumber(date, ordEditingId);
+      }finally{ if(_saveBtn) _saveBtn.disabled = false; }
       const _now = new Date().toISOString();
       if(ordEditingId){
         data.createdBy = (row && row.createdBy) || currentActorName();
@@ -4152,20 +4248,12 @@
   }
 
   /* ================= Products page (PIN-gated) ================= */
-  // Public stock snapshot for shop.html: remaining per product + per colour.
-  // Quantities ONLY — cost lots and orders never leave the back office.
+  // Runs after every save that can move stock (products, lots, orders) so the
+  // product status tag follows stock. (The public shop.html snapshot it used to
+  // write is gone along with the Storefront.) Written directly to avoid
+  // recursing back into saveProducts().
   async function syncPublicStock(){
-    // Status follows stock, so refresh it here — this runs after every save that
-    // can move stock (products, lots, orders). Written directly to avoid
-    // recursing back into saveProducts().
     if(syncProductTags()) await window.Store.set(K_PRODUCTS, products);
-    const snap = {};
-    products.forEach(p=>{
-      const entry = { total: stockOf(p).remaining, colors: {} };
-      if(p.hasColors && Array.isArray(p.colors)) p.colors.forEach(c=>{ entry.colors[c.id] = stockOfColor(p, c.id).remaining; });
-      snap[p.id] = entry;
-    });
-    await window.Store.set(K_STOCKPUB, snap);
   }
   // Buying stock IS an expense: every restock (and a new product's opening
   // stock) posts one row under the locked "Product" tag. Marked auto:true so
@@ -4322,7 +4410,7 @@
   // In Stock while anything is left, Out of Stock the moment it runs out.
   function productStatusOf(p){ return stockOf(p).remaining > 0 ? 'In Stock' : 'Out of Stock'; }
   function prodTagLabel(name){ const t = PRODUCT_TAGS.find(x=> x.name === name); return t ? itemLabel(t) : name; }
-  // Keeps the stored tag in step with reality (the storefront and exports read p.tag).
+  // Keeps the stored tag in step with reality (exports read p.tag).
   function syncProductTags(){
     let changed = false;
     products.forEach(p=>{
@@ -4365,13 +4453,14 @@
     body.innerHTML = `
       <div class="panel">
         <div class="art-toolbar">
+          <div class="art-field prod-cat-field"><label for="prodCatFilter">${esc(T('prod.ptype'))}</label><select id="prodCatFilter"></select></div>
           <div class="art-spacer"></div>
           <button class="btn btn-ghost" id="prodPromo">${esc(T('promo.btn'))}</button>
           <button class="btn btn-ghost" id="prodRestock">${esc(T('prod.restock'))}</button>
           <button class="btn btn-primary" id="prodAdd">${esc(T('prod.add'))}</button>
         </div>
-        <div class="art-table-wrap">
-          <table class="art-table" id="prodTable">
+        <div class="art-table-wrap prod-scroll">
+          <table class="art-table prod-table" id="prodTable">
             <thead><tr>
               <th>${esc(T('prod.image'))}</th><th>${esc(T('prod.sku'))}</th><th>${esc(T('prod.name'))}</th>
               <th class="num">${esc(T('prod.cost'))}</th><th class="num">${esc(T('prod.price'))}</th>
@@ -4382,8 +4471,14 @@
             <tbody id="prodTbody"></tbody>
           </table>
         </div>
+        <div id="prodPager" class="prod-pager"></div>
         <div id="prodEmpty" class="art-empty" style="display:none;"><div class="art-empty-ico">🏷️</div>${esc(T('prod.empty'))}</div>
       </div>`;
+    body.querySelector('#prodCatFilter').addEventListener('change', (e)=>{
+      prodFilterCat = e.target.value; prodPage = 1;
+      renderProductsTable(body);
+      const sc = body.querySelector('.prod-scroll'); if(sc) sc.scrollTop = 0;
+    });
     body.querySelector('#prodAdd').addEventListener('click', ()=> openProductModal(null, body));
     body.querySelector('#prodRestock').addEventListener('click', ()=> openRestockModal(body));
     body.querySelector('#prodPromo').addEventListener('click', ()=> openPromoManager(body));
@@ -4442,11 +4537,30 @@
     const table = body.querySelector('#prodTable');
     const empty = body.querySelector('#prodEmpty');
     if(!tbody) return;
-    if(products.length === 0){
+    // Category dropdown — rebuilt each render so counts stay right after edits.
+    const catSel = body.querySelector('#prodCatFilter');
+    const cats = (config.productTypes || []).map(t=> t.name);
+    if(prodFilterCat && prodFilterCat !== '__none' && !cats.includes(prodFilterCat)) prodFilterCat = '';
+    if(catSel){
+      const cnt = (c)=> products.filter(p=> (p.productType||'') === c).length;
+      const noCat = products.filter(p=> !p.productType || !cats.includes(p.productType)).length;
+      catSel.innerHTML = `<option value="">${esc(T('prod.allCats'))} (${products.length})</option>`
+        + cats.map(c=> `<option value="${esc(c)}" ${prodFilterCat===c?'selected':''}>${esc(ptypeLabel(c))} (${cnt(c)})</option>`).join('')
+        + (noCat ? `<option value="__none" ${prodFilterCat==='__none'?'selected':''}>${esc(T('prod.noCat'))} (${noCat})</option>` : '');
+    }
+    const shown = !prodFilterCat ? products
+      : prodFilterCat === '__none' ? products.filter(p=> !p.productType || !cats.includes(p.productType))
+      : products.filter(p=> (p.productType||'') === prodFilterCat);
+    const pages = Math.max(1, Math.ceil(shown.length / PROD_PAGE_SIZE));
+    if(prodPage > pages) prodPage = pages;
+    if(prodPage < 1) prodPage = 1;
+    const pageRows = shown.slice((prodPage-1)*PROD_PAGE_SIZE, prodPage*PROD_PAGE_SIZE);
+    drawProdPager(body, shown.length, pages);
+    if(shown.length === 0){
       tbody.innerHTML=''; table.style.display='none'; empty.style.display='block';
     }else{
       table.style.display=''; empty.style.display='none';
-      tbody.innerHTML = products.map(p=>{
+      tbody.innerHTML = pageRows.map(p=>{
         const thumb = p.image ? `<img class="art-prod-thumb" src="${p.image}" alt="">` : `<div class="art-prod-thumb art-prod-noimg">🏷️</div>`;
         const st = stockOf(p);
         const low = st.remaining <= 0;
@@ -4523,6 +4637,28 @@
     }
   }
 
+  // Pager under the products table: ‹ 1 2 3 › with a "showing a–b of n" note.
+  function drawProdPager(body, total, pages){
+    const el = body.querySelector('#prodPager'); if(!el) return;
+    if(total <= PROD_PAGE_SIZE){ el.innerHTML = total ? `<span class="prod-pager-info">${esc(T('prod.showing').replace('{a}', total ? 1 : 0).replace('{b}', total).replace('{n}', total))}</span>` : ''; return; }
+    const a = (prodPage-1)*PROD_PAGE_SIZE + 1, b = Math.min(total, prodPage*PROD_PAGE_SIZE);
+    // Page numbers: first, last, and two either side of the current one.
+    const nums = [];
+    for(let i=1;i<=pages;i++){ if(i===1 || i===pages || Math.abs(i-prodPage)<=2) nums.push(i); else if(nums[nums.length-1] !== '…') nums.push('…'); }
+    el.innerHTML = `<span class="prod-pager-info">${esc(T('prod.showing').replace('{a}', a).replace('{b}', b).replace('{n}', total))}</span>
+      <div class="prod-pager-btns">
+        <button type="button" class="prod-pg" data-pg="${prodPage-1}" ${prodPage<=1?'disabled':''}>‹</button>
+        ${nums.map(n=> n==='…' ? `<span class="prod-pg-gap">…</span>` : `<button type="button" class="prod-pg ${n===prodPage?'active':''}" data-pg="${n}">${n}</button>`).join('')}
+        <button type="button" class="prod-pg" data-pg="${prodPage+1}" ${prodPage>=pages?'disabled':''}>›</button>
+      </div>`;
+    el.querySelectorAll('.prod-pg[data-pg]').forEach(btn=> btn.addEventListener('click', ()=>{
+      const n = parseInt(btn.dataset.pg, 10);
+      if(!n || n < 1 || n > pages || n === prodPage) return;
+      prodPage = n; renderProductsTable(body);
+      const sc = body.querySelector('.prod-scroll'); if(sc) sc.scrollTop = 0;
+    }));
+  }
+
   function openProductModal(row, body){
     prodEditingId = row ? row.id : null;
     prodImageData = row ? (row.image || null) : null;
@@ -4530,8 +4666,8 @@
     let pHasColors = !!(row && row.hasColors);
     let pColors = (row && Array.isArray(row.colors)) ? JSON.parse(JSON.stringify(row.colors)) : [];
     pColors.forEach(c=>{ if(!Array.isArray(c.images)) c.images = c.image ? [c.image] : []; if(!Array.isArray(c.imageNames)) c.imageNames = []; while(c.imageNames.length < c.images.length) c.imageNames.push(''); });
-    let pImages = (row && Array.isArray(row.images) && row.images.length) ? row.images.slice(0,5) : (row && row.image ? [row.image] : []);
-    let pImageNames = (row && Array.isArray(row.imageNames)) ? row.imageNames.slice(0,5) : [];
+    let pImages = (row && Array.isArray(row.images) && row.images.length) ? row.images.slice() : (row && row.image ? [row.image] : []);
+    let pImageNames = (row && Array.isArray(row.imageNames)) ? row.imageNames.slice() : [];
     while(pImageNames.length < pImages.length) pImageNames.push('');
     const ov = body;
     ov.innerHTML = `
@@ -4548,7 +4684,7 @@
           <label class="art-form-full">${esc(T('prod.desc'))}<textarea id="pDesc" rows="3" placeholder="${esc(T('prod.descPh'))}">${row?esc(row.description||''):''}</textarea></label>
         </div>
         <div class="art-img-field" id="pImgField" style="${pHasColors?'display:none;':''}">
-          <label class="art-img-label">${esc(T('prod.image'))} <span class="pi-hint">${esc(T('img.max5'))}</span></label>
+          <label class="art-img-label">${esc(T('prod.image'))} </label>
           <div class="pi-grid" id="pImgGrid"></div>
         </div>
         <h4 class="art-form-section">${esc(T('pc.section'))}</h4>
@@ -4577,10 +4713,8 @@
     const g = (id)=> ov.querySelector('#'+id);
     function addImageFiles(files, arr, names, done){
       Array.from(files || []).forEach(file=>{
-        if(arr.length >= 5){ return; }
-        if(file.size > 256*1024){ alert(T('bill.tooBig')); return; }
         const rd = new FileReader();
-        rd.onload = ()=>{ if(arr.length < 5){ arr.push(rd.result); names.push(file.name || ''); done(); } };
+        rd.onload = ()=>{ arr.push(rd.result); names.push(file.name || ''); done(); };
         rd.readAsDataURL(file);
       });
     }
@@ -4590,7 +4724,7 @@
     function drawImages(){
       const wrap = g('pImgGrid'); if(!wrap) return;
       wrap.innerHTML = thumbsHtml(pImages, '', 'data-main="1"')
-        + (pImages.length < 5 ? `<label class="pi-add"><input type="file" id="pImgInput" accept="image/*" multiple><span>+</span></label>` : '');
+        + `<label class="pi-add"><input type="file" id="pImgInput" accept="image/*" multiple><span>+</span></label>`;
       wrap.querySelectorAll('.pi-rm').forEach(b=> b.addEventListener('click', ()=>{ const j = +b.dataset.j; pImages.splice(j, 1); pImageNames.splice(j, 1); drawImages(); }));
       const inp = wrap.querySelector('#pImgInput');
       if(inp) inp.addEventListener('change', (e)=> addImageFiles(e.target.files, pImages, pImageNames, drawImages));
@@ -4615,7 +4749,7 @@
             <input type="number" class="pc-num pc-price" data-i="${i}" value="${c.price!=null?c.price:''}" step="0.01" placeholder="${esc(T('prod.price'))}" title="${esc(T('prod.price'))}">
             <button type="button" class="pc-del" data-i="${i}" title="${esc(T('delete'))}">\u2715</button>
           </div>
-          <div class="pi-grid pc-imgs">${thumbsHtml(c.images, 'sm', `data-ci="${i}"`)}${c.images.length < 5 ? `<label class="pi-add sm" title="${esc(T('pc.image'))}"><input type="file" class="pc-img" data-i="${i}" accept="image/*" multiple><span>+</span></label>` : ''}</div>
+          <div class="pi-grid pc-imgs">${thumbsHtml(c.images, 'sm', `data-ci="${i}"`)}${`<label class="pi-add sm" title="${esc(T('pc.image'))}"><input type="file" class="pc-img" data-i="${i}" accept="image/*" multiple><span>+</span></label>`}</div>
         </div>`; }).join('') + `<button type="button" class="btn btn-ghost pc-add" id="pcAdd">${esc(T('pc.add'))}</button>`;
       wrap.querySelectorAll('.pc-hex').forEach(inp=> inp.addEventListener('input', ()=>{ pColors[+inp.dataset.i].hex = inp.value; }));
       wrap.querySelectorAll('.pc-name').forEach(inp=> inp.addEventListener('input', ()=>{ pColors[+inp.dataset.i].name = inp.value; }));
@@ -4639,7 +4773,6 @@
     const pbi = g('pBillInput');
     if(pbi) pbi.addEventListener('change', (e)=>{
       const file = e.target.files[0]; if(!file){ prodBillData=null; return; }
-      if(file.size > 256*1024){ alert(T('bill.tooBig')); e.target.value=''; prodBillData=null; return; }
       const nm = ov.querySelector('#pBillName'); if(nm) nm.textContent = file.name;
       const reader2 = new FileReader();
       reader2.onload = ()=>{ prodBillData = reader2.result; };
@@ -4660,9 +4793,9 @@
         description: (g('pDesc') ? g('pDesc').value.trim() : ''),
         cost: row ? (row.cost || 0) : 0, price: parseFloat(g('pPrice').value)||0,
         stock: row ? (row.stock || 0) : 0, tag: (row ? (row.tag || 'In Stock') : 'Out of Stock'),
-        image: pImages[0] || null, images: pImages.slice(0,5), imageNames: pImageNames.slice(0,5),
+        image: pImages[0] || null, images: pImages.slice(), imageNames: pImageNames.slice(),
         hasColors: pHasColors,
-        colors: pHasColors ? pColors.map(c=>{ const im = (Array.isArray(c.images)?c.images:[]).slice(0,5); return { id: c.id, name: c.name, hex: c.hex, price: (c.price === '' || c.price == null) ? null : Number(c.price), images: im, imageNames: (Array.isArray(c.imageNames)?c.imageNames:[]).slice(0,5), image: im[0] || null }; }) : []
+        colors: pHasColors ? pColors.map(c=>{ const im = (Array.isArray(c.images)?c.images:[]).slice(); return { id: c.id, name: c.name, hex: c.hex, price: (c.price === '' || c.price == null) ? null : Number(c.price), images: im, imageNames: (Array.isArray(c.imageNames)?c.imageNames:[]).slice(0,5), image: im[0] || null }; }) : []
       };
       if(pHasColors){
         const _ps = data.colors.map(c=> Number(c.price)||0).filter(v=> v > 0);
@@ -4757,6 +4890,114 @@
       openPromoEditor(null, ()=>{ drawList(); renderProductsTable(body); });
     });
     drawList();
+  }
+
+  // First image of a product (new multi-image field, old single field as fallback).
+  function productThumb(p){
+    if(!p) return '';
+    if(Array.isArray(p.images) && p.images.length) return p.images[0];
+    return p.image || '';
+  }
+
+  /* ---- Product picker popup (used by the bill form) ----
+     Search by name/SKU, filter by category, or pick "Repair charge" to type a
+     free-text description + price. onPick gets { productId } or
+     { kind:'repair', desc, price }. */
+  function openProductPicker(opts){
+    const o = opts || {};
+    const cats = (config.productTypes || []).map(t=> t.name);
+    let cat = '';      // '' = all · '__repair' = repair form
+    let q = '';
+    const ov = document.createElement('div');
+    ov.className = 'art-modal-overlay show pp-overlay';
+    ov.innerHTML = `
+      <div class="art-modal art-modal-lg pp-modal" role="dialog" aria-modal="true">
+        <div class="pp-head">
+          <h3 class="art-modal-title">${esc(T('pp.title'))}</h3>
+          <button type="button" class="acc-icon pp-close" title="${esc(T('cancel'))}">✕</button>
+        </div>
+        <div class="pp-search"><span class="pp-search-ico">\u{1F50D}</span><input type="search" id="ppQ" placeholder="${esc(T('pp.searchPh'))}" autocomplete="off"></div>
+        <div class="pp-cats" id="ppCats"></div>
+        <div class="pp-body" id="ppBody"></div>
+      </div>`;
+    document.body.appendChild(ov);
+    const g = (id)=> ov.querySelector('#'+id);
+    const close = ()=>{ document.removeEventListener('keydown', onKey, true); ov.remove(); };
+    function onKey(e){
+      if(e.key === 'Escape'){ e.preventDefault(); e.stopPropagation(); close(); }
+    }
+    document.addEventListener('keydown', onKey, true);
+    ov.addEventListener('mousedown', e=>{ if(e.target === ov) close(); });
+    ov.querySelector('.pp-close').addEventListener('click', close);
+    const pick = (res)=>{ close(); if(typeof o.onPick === 'function') o.onPick(res); };
+
+    function drawCats(){
+      const cnt = (c)=> products.filter(p=> (p.productType||'') === c).length;
+      g('ppCats').innerHTML =
+        `<button type="button" class="pp-cat ${cat===''?'active':''}" data-c="">${esc(T('prod.allCats'))} <i>${products.length}</i></button>`
+        + cats.map(c=> `<button type="button" class="pp-cat ${cat===c?'active':''}" data-c="${esc(c)}"><span class="pp-dot" style="background:${esc(ptypeColor(c))}"></span>${esc(ptypeLabel(c))} <i>${cnt(c)}</i></button>`).join('')
+        + `<button type="button" class="pp-cat pp-cat-repair ${cat==='__repair'?'active':''}" data-c="__repair">\u{1F527} ${esc(T('pp.repair'))}</button>`;
+      g('ppCats').querySelectorAll('.pp-cat').forEach(b=> b.addEventListener('click', ()=>{
+        cat = b.dataset.c; drawCats(); drawBody();
+        if(cat !== '__repair') g('ppQ').focus();
+      }));
+    }
+    function matches(p){
+      if(cat && (p.productType||'') !== cat) return false;
+      if(!q) return true;
+      const hay = ((p.name||'') + ' ' + (p.sku||'') + ' ' + ptypeLabel(p.productType||'')).toLowerCase();
+      return q.split(/\s+/).filter(Boolean).every(w=> hay.includes(w));
+    }
+    function drawBody(){
+      const body = g('ppBody');
+      g('ppQ').parentElement.style.display = cat === '__repair' ? 'none' : '';
+      if(cat === '__repair'){
+        body.innerHTML = `
+          <div class="pp-repair">
+            <p class="pp-repair-hint">${esc(T('pp.repairHint'))}</p>
+            <label>${esc(T('pp.repairDesc'))} <span class="art-req">*</span><textarea id="ppRDesc" rows="3" placeholder="${esc(T('pp.repairDescPh'))}"></textarea></label>
+            <label>${esc(T('pp.repairPrice'))} <span class="art-req">*</span><input type="number" id="ppRPrice" min="0" step="0.01" placeholder="0.00"></label>
+            <div class="art-modal-actions"><button type="button" class="btn btn-primary" id="ppRAdd">${esc(T('pp.repairAdd'))}</button></div>
+          </div>`;
+        const d = g('ppRDesc'), pr = g('ppRPrice');
+        setTimeout(()=> d.focus(), 0);
+        const go = ()=>{
+          const desc = d.value.trim();
+          if(!desc){ alert(T('pp.errRepairDesc')); d.focus(); return; }
+          pick({ kind:'repair', desc, price: Math.abs(parseFloat(pr.value)||0) });
+        };
+        g('ppRAdd').addEventListener('click', go);
+        pr.addEventListener('keydown', e=>{ if(e.key === 'Enter'){ e.preventDefault(); go(); } });
+        return;
+      }
+      const list = products.filter(matches);
+      if(!products.length){ body.innerHTML = `<div class="pp-empty">${esc(T('rev.noProducts'))}</div>`; return; }
+      if(!list.length){ body.innerHTML = `<div class="pp-empty">${esc(T('pp.noMatch'))}</div>`; return; }
+      body.innerHTML = `<div class="pp-count">${esc(T('pp.count').replace('{n}', list.length))}</div><div class="pp-list">` + list.map(p=>{
+        const th = productThumb(p);
+        const st = stockOf(p).remaining;
+        const pct = activePromoPercent(p.id);
+        const price = pct > 0 ? Math.round(p.price * (1 - pct/100) * 100) / 100 : p.price;
+        return `<button type="button" class="pp-item ${p.id===o.currentId?'current':''} ${st<=0?'pp-out':''}" data-id="${esc(p.id)}">
+          ${th ? `<img class="pp-thumb" src="${esc(th)}" alt="" loading="lazy">` : `<span class="pp-thumb pp-noimg">\u{1F3F7}️</span>`}
+          <span class="pp-info">
+            <span class="pp-name">${esc(p.name||'-')}</span>
+            <span class="pp-meta">${p.sku?`<span class="pp-sku">${esc(p.sku)}</span>`:''}${p.productType?`<span class="art-pill" style="background:${esc(ptypeColor(p.productType))}">${esc(ptypeLabel(p.productType))}</span>`:''}</span>
+          </span>
+          <span class="pp-right">
+            <span class="pp-price">฿${fmt(price)}${pct>0?` <i class="art-item-sale">-${pct}%</i>`:''}</span>
+            <span class="pp-stock ${st<=0?'art-neg':''}">${esc(T('prod.stock'))} ${st}</span>
+          </span>
+        </button>`;
+      }).join('') + `</div>`;
+      body.querySelectorAll('.pp-item').forEach(b=> b.addEventListener('click', ()=> pick({ productId: b.dataset.id })));
+    }
+    g('ppQ').addEventListener('input', (e)=>{ q = e.target.value.trim().toLowerCase(); drawBody(); });
+    g('ppQ').addEventListener('keydown', (e)=>{
+      if(e.key === 'Enter'){ e.preventDefault(); const first = ov.querySelector('.pp-item'); if(first) first.click(); }
+    });
+    drawCats(); drawBody();
+    setTimeout(()=> g('ppQ').focus(), 0);
   }
 
   function openPromoEditor(promo, onDone){
@@ -5061,7 +5302,6 @@
     const rbi = g('rsBillInput');
     if(rbi) rbi.addEventListener('change', (e)=>{
       const file = e.target.files[0]; if(!file){ rsBillData=null; return; }
-      if(file.size > 256*1024){ alert(T('bill.tooBig')); e.target.value=''; rsBillData=null; return; }
       const nm = g('rsBillName'); if(nm) nm.textContent = file.name;
       const reader = new FileReader();
       reader.onload = ()=>{ rsBillData = reader.result; };
@@ -5159,7 +5399,7 @@
   // Payment slips: shown together with per-file download links.
   // Attach/replace the payment slips without opening the whole order form.
   function openProofEditor(order, onDone){
-    let list = Array.isArray(order.paymentProofs) ? order.paymentProofs.slice(0,5) : [];
+    let list = Array.isArray(order.paymentProofs) ? order.paymentProofs.slice() : [];
     const ov = document.createElement('div');
     ov.className = 'art-modal-overlay show';
     ov.innerHTML = `<div class="art-modal" style="max-width:560px;">
@@ -5175,15 +5415,13 @@
     const grid = ov.querySelector('#peGrid');
     function draw(){
       grid.innerHTML = list.map((f,i)=> `<span class="pi-thumb"><img src="${esc(f.src)}" alt=""><button type="button" class="pi-rm" data-j="${i}" title="${esc(T('delete'))}">\u2715</button></span>`).join('')
-        + (list.length < 5 ? `<label class="pi-add"><input type="file" class="pe-input" accept="image/*" multiple><span>+</span></label>` : '');
+        + `<label class="pi-add"><input type="file" class="pe-input" accept="image/*" multiple><span>+</span></label>`;
       grid.querySelectorAll('.pi-rm').forEach(b=> b.addEventListener('click', ()=>{ list.splice(+b.dataset.j, 1); draw(); }));
       const inp = grid.querySelector('.pe-input');
       if(inp) inp.addEventListener('change', (e)=>{
         Array.from(e.target.files || []).forEach(file=>{
-          if(list.length >= 5) return;
-          if(file.size > 256*1024){ alert(T('bill.tooBig')); return; }
           const rd = new FileReader();
-          rd.onload = ()=>{ if(list.length < 5){ list.push({ src: rd.result, name: file.name || '' }); draw(); } };
+          rd.onload = ()=>{ list.push({ src: rd.result, name: file.name || '' }); draw(); };
           rd.readAsDataURL(file);
         });
       });
@@ -5195,7 +5433,7 @@
     ov.addEventListener('click', e=>{ if(e.target === ov) close(); });
     ov.querySelector('#peCancel').addEventListener('click', close);
     ov.querySelector('#peSave').addEventListener('click', async ()=>{
-      order.paymentProofs = list.slice(0,5);
+      order.paymentProofs = list.slice();
       await saveOrders();
       close();
       if(typeof onDone === 'function') onDone();
@@ -5550,10 +5788,10 @@
       'sum.period': 'ช่วงเวลา', 'sum.allTime': 'ทั้งหมด', 'sum.tag': 'ป้ายกำกับ', 'sum.netTotal': 'ยอดสุทธิ', 'sum.percent': '% ของยอดรวม',
       'sum.sum': 'รวม', 'sum.totalNet': 'รวมรายจ่าย (สุทธิ)', 'sum.count': 'จำนวนรายการ', 'sum.avg': 'เฉลี่ยต่อรายการ', 'sum.byCategory':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E15\u0E32\u0E21\u0E2B\u0E21\u0E27\u0E14\u0E2B\u0E21\u0E39\u0E48\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'sum.byOrigin':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E15\u0E32\u0E21\u0E41\u0E2B\u0E25\u0E48\u0E07\u0E17\u0E35\u0E48\u0E21\u0E32', 'sum.uncategorised':'\u0E44\u0E21\u0E48\u0E23\u0E30\u0E1A\u0E38\u0E2B\u0E21\u0E27\u0E14\u0E2B\u0E21\u0E39\u0E48', 'sum.noOrigin':'\u0E44\u0E21\u0E48\u0E23\u0E30\u0E1A\u0E38\u0E41\u0E2B\u0E25\u0E48\u0E07', 'sum.noData': 'ยังไม่มีข้อมูลในช่วงนี้',
       'rev.add': '+ เพิ่มออเดอร์', 'rev.addTitle': 'เพิ่มออเดอร์', 'rev.editTitle': 'แก้ไขออเดอร์',
-      'rev.invoiceNo': 'เลขบิล', 'col.lastEdited':'แก้ล่าสุด', 'rev.customer': 'ชื่อผู้รับ', 'rev.customerHint': 'ชื่อ-นามสกุลผู้รับ', 'rev.back':'กลับ', 'rev.mapHint':'หรือกดเลือกจังหวัดจากแผนที่', 'rev.selProvince':'จังหวัดที่เลือก', 'rev.noProvince':'ยังไม่ได้เลือกจังหวัด', 'region.north':'ภาคเหนือ', 'region.central':'ภาคกลาง', 'region.northeast':'ภาคตะวันออกเฉียงเหนือ', 'region.east':'ภาคตะวันออก', 'region.west':'ภาคตะวันตก', 'region.south':'ภาคใต้', 'rev.address': 'ที่อยู่ผู้รับ', 'rev.addressHint': 'ที่อยู่สำหรับจัดส่ง', 'rev.addrLine':'ที่อยู่ (บ้านเลขที่/หมู่/ซอย/ถนน)', 'rev.addrLineHint':'บ้านเลขที่ หมู่ ตรอก/ซอย ถนน', 'rev.province':'จังหวัด', 'rev.district':'อำเภอ/เขต', 'rev.subdistrict':'ตำบล/แขวง', 'rev.postal':'รหัสไปรษณีย์', 'rev.postalHint':'อัตโนมัติ', 'rev.loading':'กำลังโหลด...', 'rev.errAddrLine':'กรุณากรอกที่อยู่ (บ้านเลขที่/ซอย/ถนน)', 'rev.errAddrGeo':'กรุณาเลือกจังหวัด/อำเภอ/ตำบลให้ครบ', 'sec.seller':'\u0E1C\u0E39\u0E49\u0E2D\u0E2D\u0E01\u0E1A\u0E34\u0E25 (Seller)', 'sell.issuedBy':'\u0E2D\u0E2D\u0E01\u0E1A\u0E34\u0E25\u0E42\u0E14\u0E22', 'sell.signature':'\u0E25\u0E32\u0E22\u0E40\u0E0B\u0E47\u0E19', 'sell.clear':'\u0E25\u0E49\u0E32\u0E07', 'sell.upload':'\u0E2D\u0E31\u0E1B\u0E42\u0E2B\u0E25\u0E14\u0E23\u0E39\u0E1B\u0E25\u0E32\u0E22\u0E40\u0E0B\u0E47\u0E19', 'sell.signHint':'\u0E27\u0E32\u0E14\u0E43\u0E19\u0E01\u0E23\u0E2D\u0E1A \u0E2B\u0E23\u0E37\u0E2D\u0E2D\u0E31\u0E1B\u0E42\u0E2B\u0E25\u0E14\u0E23\u0E39\u0E1B (\u0E44\u0E21\u0E48\u0E40\u0E01\u0E34\u0E19 256KB)', 'sell.errSign':'\u0E01\u0E23\u0E38\u0E13\u0E32\u0E40\u0E0B\u0E47\u0E19\u0E0A\u0E37\u0E48\u0E2D\u0E01\u0E48\u0E2D\u0E19\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01', 'sell.seller':'\u0E1C\u0E39\u0E49\u0E2D\u0E2D\u0E01\u0E1A\u0E34\u0E25', 'rev.platformFee':'\u0E04\u0E48\u0E32\u0E18\u0E23\u0E23\u0E21\u0E40\u0E19\u0E35\u0E22\u0E21\u0E41\u0E1E\u0E25\u0E15\u0E1F\u0E2D\u0E23\u0E4C\u0E21', 'rev.platform': 'ขายผ่าน Platform', 'rev.platformHint': 'เช่น TikTok Shop', 'sec.delivery':'การจัดส่ง', 'sec.inventory':'รายการสินค้า (Inventory)', 'rev.phone':'เบอร์โทรติดต่อ', 'rev.phoneHint':'เบอร์โทรศัพท์ผู้รับ', 'rev.shippingTitle':'ค่าจัดส่ง', 'rev.shippingCost':'ค่าจัดส่ง', 'rev.shippingOverride':'ตั้งค่าส่งเอง (ทับ auto)', 'rev.shipAuto':'อัตโนมัติ', 'rev.shipNoCat':'ยังไม่มีสินค้า/หมวดหมู่', 'sec.vat':'\u0E01\u0E32\u0E23\u0E04\u0E33\u0E19\u0E27\u0E13 VAT', 'sec.payment':'\u0E01\u0E32\u0E23\u0E0A\u0E33\u0E23\u0E30\u0E40\u0E07\u0E34\u0E19', 'pay.mode':'\u0E27\u0E34\u0E18\u0E35\u0E0A\u0E33\u0E23\u0E30\u0E40\u0E07\u0E34\u0E19', 'pay.paid':'\u0E0A\u0E33\u0E23\u0E30\u0E41\u0E25\u0E49\u0E27 (\u0E21\u0E31\u0E14\u0E08\u0E33)', 'pay.vatable':'\u0E1A\u0E34\u0E25\u0E19\u0E35\u0E49\u0E04\u0E34\u0E14 VAT 7% (\u0E1A\u0E27\u0E01\u0E40\u0E1E\u0E34\u0E48\u0E21\u0E08\u0E32\u0E01\u0E22\u0E2D\u0E14\u0E2A\u0E38\u0E17\u0E18\u0E34)', 'pay.vat':'VAT', 'pay.vatSeparated':'\u0E41\u0E22\u0E01\u0E1A\u0E34\u0E25 (VAT 7%)', 'pay.vatYes':'VAT 7%', 'pay.noProof':'\u0E1A\u0E34\u0E25\u0E19\u0E35\u0E49\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E41\u0E19\u0E1A\u0E2B\u0E25\u0E31\u0E01\u0E10\u0E32\u0E19', 'pay.proof':'\u0E2B\u0E25\u0E31\u0E01\u0E10\u0E32\u0E19\u0E01\u0E32\u0E23\u0E0A\u0E33\u0E23\u0E30\u0E40\u0E07\u0E34\u0E19', 'pay.proofHint':'\u0E2A\u0E39\u0E07\u0E2A\u0E38\u0E14 5 \u0E44\u0E1F\u0E25\u0E4C (\u0E44\u0E21\u0E48\u0E40\u0E01\u0E34\u0E19 256KB \u0E15\u0E48\u0E2D\u0E44\u0E1F\u0E25\u0E4C)', 'pay.download':'\u0E14\u0E32\u0E27\u0E19\u0E4C\u0E42\u0E2B\u0E25\u0E14', 'pay.pending':'\u0E22\u0E2D\u0E14\u0E04\u0E49\u0E32\u0E07\u0E0A\u0E33\u0E23\u0E30', 'set.colTh':'\u0E0A\u0E37\u0E48\u0E2D\u0E20\u0E32\u0E29\u0E32\u0E44\u0E17\u0E22 (TH)', 'set.colEn':'\u0E0A\u0E37\u0E48\u0E2D\u0E20\u0E32\u0E29\u0E32\u0E2D\u0E31\u0E07\u0E01\u0E24\u0E29 (EN)', 'set.colFee':'\u0E04\u0E48\u0E32\u0E18\u0E23\u0E23\u0E21\u0E40\u0E19\u0E35\u0E22\u0E21 %', 'set.colColor':'\u0E2A\u0E35', 'set.expenseCategories':'\u0E2B\u0E21\u0E27\u0E14\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22 (Expense Category)', 'set.platforms':'\u0E0A\u0E48\u0E2D\u0E07\u0E17\u0E32\u0E07\u0E01\u0E32\u0E23\u0E02\u0E32\u0E22 (Platform)', 'set.feeHint':'\u0E04\u0E48\u0E32\u0E18\u0E23\u0E23\u0E21\u0E40\u0E19\u0E35\u0E22\u0E21\u0E41\u0E1E\u0E25\u0E15\u0E1F\u0E2D\u0E23\u0E4C\u0E21 (%)', 'set.paymentModes':'\u0E27\u0E34\u0E18\u0E35\u0E0A\u0E33\u0E23\u0E30\u0E40\u0E07\u0E34\u0E19', 'rev.discountsTitle':'ส่วนลด', 'rev.itemDiscount':'ส่วนลดสินค้า', 'rev.shippingDiscount':'ส่วนลดค่าส่ง', 'rev.overallDiscount':'ส่วนลดรวมทั้งบิล', 'rev.totalDiscount':'ส่วนลดรวม', 'rev.deliveryMethod':'วิธีจัดส่ง', 'rev.responsible':'ผู้รับผิดชอบ', 'rev.pickResp':'— เลือก —', 'rev.respHint':'ระบุผู้รับผิดชอบ', 'rev.proofLabel':'หลักฐานการจัดส่ง (Outsource)', 'rev.proofPick':'แนบไฟล์', 'rev.proofAttached':'แนบแล้ว', 'rev.proofNone':'ยังไม่ได้แนบ', 'rev.items': 'รายการสินค้า', 'del.allProvinces':'ทุกจังหวัด', 'del.allRegions':'ทุกภาค', 'del.allStatuses':'ทุกสถานะ', 'del.orderNo':'เลขที่ออเดอร์', 'del.recipient':'ผู้รับ', 'del.province':'จังหวัด', 'del.region':'ภาค', 'del.address':'ที่อยู่', 'del.status':'สถานะจัดส่ง', 'del.shipType':'วิธีจัดส่ง', 'del.responsible':'ผู้รับผิดชอบ', 'del.proof':'หลักฐาน', 'del.verified':'ยืนยัน', 'del.deliveryDate':'วันจัดส่ง', 'nav.productHistory':'ประวัติแก้ไข', 'nav.invoicing':'\u0E43\u0E1A\u0E41\u0E08\u0E49\u0E07\u0E2B\u0E19\u0E35\u0E49', 'nav.arStatus':'\u0E2A\u0E16\u0E32\u0E19\u0E30\u0E25\u0E39\u0E01\u0E2B\u0E19\u0E35\u0E49 (AR)', 'nav.receipts':'\u0E43\u0E1A\u0E40\u0E2A\u0E23\u0E47\u0E08', 'rc.avg':'\u0E40\u0E09\u0E25\u0E35\u0E48\u0E22\u0E15\u0E48\u0E2D\u0E43\u0E1A', 'inv.deposit':'\u0E21\u0E31\u0E14\u0E08\u0E33\u0E17\u0E35\u0E48\u0E23\u0E31\u0E1A\u0E21\u0E32\u0E41\u0E25\u0E49\u0E27', 'rc.count':'\u0E08\u0E33\u0E19\u0E27\u0E19\u0E43\u0E1A\u0E40\u0E2A\u0E23\u0E47\u0E08', 'rc.total':'\u0E22\u0E2D\u0E14\u0E23\u0E27\u0E21', 'rc.byMode':'\u0E41\u0E22\u0E01\u0E15\u0E32\u0E21\u0E0A\u0E48\u0E2D\u0E07\u0E17\u0E32\u0E07\u0E0A\u0E33\u0E23\u0E30', 'rc.receipts':'\u0E43\u0E1A\u0E40\u0E2A\u0E23\u0E47\u0E08', 'rc.empty':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E21\u0E35\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E0A\u0E33\u0E23\u0E30\u0E41\u0E25\u0E49\u0E27', 'se.delivery':'\u0E04\u0E48\u0E32\u0E2A\u0E48\u0E07\u0E08\u0E23\u0E34\u0E07', 'se.other':'\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22\u0E2D\u0E37\u0E48\u0E19', 'se.status':'\u0E2A\u0E16\u0E32\u0E19\u0E30', 'se.added':'\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E41\u0E25\u0E49\u0E27', 'se.none':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01', 'se.addNote':'\u0E40\u0E1E\u0E34\u0E48\u0E21\u0E42\u0E19\u0E49\u0E15', 'nav.sellingExpenses':'\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22\u0E43\u0E19\u0E01\u0E32\u0E23\u0E02\u0E32\u0E22', 'ap.mass':'\u0E15\u0E31\u0E49\u0E07\u0E08\u0E48\u0E32\u0E22\u0E04\u0E23\u0E1A\u0E17\u0E31\u0E49\u0E07\u0E2B\u0E21\u0E14', 'ap.massBody':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E31\u0E49\u0E07 {n} \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E01\u0E23\u0E2D\u0E07\u0E2D\u0E22\u0E39\u0E48\u0E15\u0E2D\u0E19\u0E19\u0E35\u0E49 \u0E08\u0E30\u0E16\u0E39\u0E01\u0E15\u0E31\u0E49\u0E07\u0E40\u0E1B\u0E47\u0E19 \u0E08\u0E48\u0E32\u0E22\u0E04\u0E23\u0E1A + \u0E22\u0E37\u0E19\u0E22\u0E31\u0E19 \u0E41\u0E25\u0E30\u0E2B\u0E25\u0E31\u0E01\u0E10\u0E32\u0E19\u0E17\u0E35\u0E48\u0E41\u0E19\u0E1A\u0E08\u0E30\u0E16\u0E39\u0E01\u0E43\u0E2A\u0E48\u0E43\u0E2B\u0E49\u0E17\u0E38\u0E01\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23 \u00B7 \u0E22\u0E31\u0E07\u0E15\u0E49\u0E2D\u0E07\u0E01\u0E14 Save \u0E2D\u0E35\u0E01\u0E04\u0E23\u0E31\u0E49\u0E07\u0E08\u0E36\u0E07\u0E08\u0E30\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01', 'ap.paidAmount':'\u0E08\u0E48\u0E32\u0E22\u0E44\u0E1B\u0E41\u0E25\u0E49\u0E27', 'ap.mass':'\u0E15\u0E31\u0E49\u0E07\u0E08\u0E48\u0E32\u0E22\u0E04\u0E23\u0E1A\u0E17\u0E31\u0E49\u0E07\u0E2B\u0E21\u0E14', 'ap.massBody':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E01\u0E23\u0E2D\u0E07\u0E44\u0E27\u0E49\u0E15\u0E2D\u0E19\u0E19\u0E35\u0E49 {n} \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23 ({amt} \u0E3F) \u0E08\u0E30\u0E16\u0E39\u0E01\u0E15\u0E31\u0E49\u0E07\u0E40\u0E1B\u0E47\u0E19 \u0E08\u0E48\u0E32\u0E22\u0E04\u0E23\u0E1A \u0E41\u0E25\u0E30 \u0E22\u0E37\u0E19\u0E22\u0E31\u0E19\u0E41\u0E25\u0E49\u0E27 \u0E17\u0E31\u0E49\u0E07\u0E2B\u0E21\u0E14', 'ap.massProofHint':'\u0E44\u0E1F\u0E25\u0E4C\u0E17\u0E35\u0E48\u0E41\u0E19\u0E1A\u0E08\u0E30\u0E16\u0E39\u0E01\u0E43\u0E2A\u0E48\u0E43\u0E2B\u0E49\u0E17\u0E38\u0E01\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23 (\u0E44\u0E21\u0E48\u0E43\u0E2A\u0E48\u0E01\u0E47\u0E44\u0E14\u0E49)', 'ox.updatedBy':'\u0E2D\u0E31\u0E1B\u0E40\u0E14\u0E15\u0E42\u0E14\u0E22', 'nav.opexHistory':'\u0E1B\u0E23\u0E30\u0E27\u0E31\u0E15\u0E34\u0E41\u0E01\u0E49\u0E44\u0E02', 'nav.finOverview':'\u0E20\u0E32\u0E1E\u0E23\u0E27\u0E21', 'nav.pnl':'\u0E01\u0E33\u0E44\u0E23\u0E02\u0E32\u0E14\u0E17\u0E38\u0E19 (P&L)', 'nav.cashFlow':'\u0E01\u0E23\u0E30\u0E41\u0E2A\u0E40\u0E07\u0E34\u0E19\u0E2A\u0E14', 'nav.taxReport':'\u0E23\u0E32\u0E22\u0E07\u0E32\u0E19\u0E20\u0E32\u0E29\u0E35\u0E02\u0E32\u0E22', 'tax.modeVat':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E04\u0E34\u0E14 VAT', 'tax.modeNoVat':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E44\u0E21\u0E48\u0E04\u0E34\u0E14 VAT', 'tax.invoices':'\u0E43\u0E1A\u0E01\u0E33\u0E01\u0E31\u0E1A\u0E20\u0E32\u0E29\u0E35', 'tax.billsNoVat':'\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E44\u0E21\u0E48\u0E04\u0E34\u0E14 VAT', 'tax.base':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E01\u0E48\u0E2D\u0E19 VAT', 'tax.output':'\u0E20\u0E32\u0E29\u0E35\u0E02\u0E32\u0E22 (VAT 7%)', 'tax.grand':'\u0E23\u0E27\u0E21\u0E17\u0E31\u0E49\u0E07\u0E2A\u0E34\u0E49\u0E19', 'tax.byMonth':'\u0E2A\u0E23\u0E38\u0E1B\u0E23\u0E32\u0E22\u0E40\u0E14\u0E37\u0E2D\u0E19 (\u0E2A\u0E33\u0E2B\u0E23\u0E31\u0E1A\u0E22\u0E37\u0E48\u0E19)', 'tax.detail':'\u0E23\u0E32\u0E22\u0E25\u0E30\u0E40\u0E2D\u0E35\u0E22\u0E14\u0E43\u0E1A\u0E01\u0E33\u0E01\u0E31\u0E1A\u0E20\u0E32\u0E29\u0E35', 'tax.detailNoVat':'\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2D\u0E22\u0E39\u0E48\u0E43\u0E19\u0E23\u0E32\u0E22\u0E07\u0E32\u0E19', 'tax.issuer':'\u0E1C\u0E39\u0E49\u0E2D\u0E2D\u0E01\u0E43\u0E1A\u0E01\u0E33\u0E01\u0E31\u0E1A', 'tax.empty':'\u0E44\u0E21\u0E48\u0E21\u0E35\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E43\u0E19\u0E0A\u0E48\u0E27\u0E07\u0E19\u0E35\u0E49', 'tax.hint':'\u0E14\u0E36\u0E07\u0E40\u0E09\u0E1E\u0E32\u0E30\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E15\u0E34\u0E4A\u0E01 VAT \u0E44\u0E27\u0E49 \u00B7 \u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E41\u0E22\u0E01\u0E04\u0E48\u0E32\u0E2A\u0E48\u0E07 \u0E04\u0E48\u0E32\u0E2A\u0E48\u0E07\u0E44\u0E21\u0E48\u0E2D\u0E22\u0E39\u0E48\u0E43\u0E19\u0E10\u0E32\u0E19\u0E20\u0E32\u0E29\u0E35 \u00B7 \u0E23\u0E32\u0E22\u0E07\u0E32\u0E19\u0E19\u0E35\u0E49\u0E40\u0E1B\u0E47\u0E19\u0E20\u0E32\u0E29\u0E35\u0E02\u0E32\u0E22\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E40\u0E14\u0E35\u0E22\u0E27 \u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2B\u0E31\u0E01\u0E20\u0E32\u0E29\u0E35\u0E0B\u0E37\u0E49\u0E2D', 'tax.hintNoVat':'\u0E1A\u0E34\u0E25\u0E40\u0E2B\u0E25\u0E48\u0E32\u0E19\u0E35\u0E49\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E19\u0E31\u0E1A\u0E43\u0E19\u0E23\u0E32\u0E22\u0E07\u0E32\u0E19\u0E20\u0E32\u0E29\u0E35\u0E02\u0E32\u0E22 \u2014 \u0E14\u0E39\u0E44\u0E27\u0E49\u0E40\u0E1C\u0E37\u0E48\u0E2D\u0E15\u0E23\u0E27\u0E08\u0E27\u0E48\u0E32\u0E25\u0E37\u0E21\u0E15\u0E34\u0E4A\u0E01 VAT \u0E2B\u0E23\u0E37\u0E2D\u0E44\u0E21\u0E48', 'cd.noteTitle':'\u0E2B\u0E21\u0E32\u0E22\u0E40\u0E2B\u0E15\u0E38\u0E1A\u0E19\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23', 'cd.noteHint':'\u0E02\u0E49\u0E2D\u0E04\u0E27\u0E32\u0E21\u0E19\u0E35\u0E49\u0E40\u0E1B\u0E47\u0E19 \u0E04\u0E48\u0E32\u0E15\u0E31\u0E49\u0E07\u0E15\u0E49\u0E19 \u0E17\u0E35\u0E48\u0E08\u0E30\u0E16\u0E39\u0E01\u0E40\u0E15\u0E34\u0E21\u0E43\u0E2B\u0E49\u0E2D\u0E31\u0E15\u0E42\u0E19\u0E21\u0E31\u0E15\u0E34\u0E43\u0E19\u0E0A\u0E48\u0E2D\u0E07 \u0E2B\u0E21\u0E32\u0E22\u0E40\u0E2B\u0E15\u0E38 \u0E15\u0E2D\u0E19\u0E2A\u0E23\u0E49\u0E32\u0E1A\u0E34\u0E25\u0E43\u0E2B\u0E21\u0E48 \u2014 \u0E41\u0E01\u0E49\u0E23\u0E32\u0E22\u0E1A\u0E34\u0E25\u0E44\u0E14\u0E49 \u0E41\u0E25\u0E30\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23\u0E08\u0E30\u0E1E\u0E34\u0E21\u0E1E\u0E4C\u0E15\u0E32\u0E21\u0E17\u0E35\u0E48\u0E23\u0E30\u0E1A\u0E38\u0E43\u0E19\u0E1A\u0E34\u0E25\u0E19\u0E31\u0E49\u0E19', 'cd.notePh':'\u0E40\u0E0A\u0E48\u0E19 \u0E40\u0E07\u0E37\u0E48\u0E2D\u0E19\u0E44\u0E02\u0E01\u0E32\u0E23\u0E23\u0E31\u0E1A\u0E1B\u0E23\u0E30\u0E01\u0E31\u0E19 \u0E27\u0E34\u0E18\u0E35\u0E14\u0E39\u0E41\u0E25\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32 \u0E0A\u0E48\u0E2D\u0E07\u0E17\u0E32\u0E07\u0E15\u0E34\u0E14\u0E15\u0E48\u0E2D', 'cd.saved':'\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E41\u0E25\u0E49\u0E27', 'cd.previewTitle':'\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E17\u0E35\u0E48\u0E08\u0E30\u0E41\u0E2A\u0E14\u0E07', 'cd.previewHint':'\u0E02\u0E49\u0E2D\u0E04\u0E27\u0E32\u0E21\u0E19\u0E35\u0E49\u0E08\u0E30\u0E27\u0E32\u0E07\u0E40\u0E2B\u0E19\u0E37\u0E2D\u0E0A\u0E48\u0E2D\u0E07\u0E25\u0E32\u0E22\u0E40\u0E0B\u0E47\u0E19\u0E43\u0E19\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23', 'cd.previewEmpty':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E43\u0E2A\u0E48\u0E2B\u0E21\u0E32\u0E22\u0E40\u0E2B\u0E15\u0E38', 'rev.remarkHint':'\u0E1E\u0E34\u0E21\u0E1E\u0E4C\u0E1A\u0E19\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23 \u00B7 \u0E40\u0E23\u0E34\u0E48\u0E21\u0E08\u0E32\u0E01\u0E04\u0E48\u0E32\u0E15\u0E31\u0E49\u0E07\u0E15\u0E49\u0E19\u0E43\u0E19\u0E2B\u0E19\u0E49\u0E32\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23\u0E25\u0E39\u0E01\u0E04\u0E49\u0E32 \u0E41\u0E01\u0E49\u0E44\u0E14\u0E49\u0E15\u0E48\u0E32\u0E07\u0E2B\u0E32\u0E01\u0E1A\u0E34\u0E25', 'rev.noteHint':'\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E20\u0E32\u0E22\u0E43\u0E19 \u0E44\u0E21\u0E48\u0E02\u0E36\u0E49\u0E19\u0E1A\u0E19\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23', 'noAccess':'\u0E1A\u0E17\u0E1A\u0E32\u0E17\u0E19\u0E35\u0E49\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E23\u0E31\u0E1A\u0E2A\u0E34\u0E17\u0E18\u0E34\u0E4C\u0E40\u0E02\u0E49\u0E32\u0E16\u0E36\u0E07\u0E2B\u0E19\u0E49\u0E32\u0E19\u0E35\u0E49', 'cd.remark':'\u0E2B\u0E21\u0E32\u0E22\u0E40\u0E2B\u0E15\u0E38', 'fin.allTime':'\u0E17\u0E31\u0E49\u0E07\u0E2B\u0E21\u0E14', 'fin.custom':'\u0E01\u0E33\u0E2B\u0E19\u0E14\u0E40\u0E2D\u0E07', 'fin.thisMonth':'\u0E40\u0E14\u0E37\u0E2D\u0E19\u0E19\u0E35\u0E49', 'fin.netProfit':'\u0E01\u0E33\u0E44\u0E23\u0E2A\u0E38\u0E17\u0E18\u0E34', 'fin.cashIn':'\u0E40\u0E07\u0E34\u0E19\u0E40\u0E02\u0E49\u0E32\u0E08\u0E23\u0E34\u0E07', 'fin.cashOut':'\u0E40\u0E07\u0E34\u0E19\u0E2D\u0E2D\u0E01\u0E08\u0E23\u0E34\u0E07', 'fin.cashNet':'\u0E40\u0E07\u0E34\u0E19\u0E2A\u0E14\u0E2A\u0E38\u0E17\u0E18\u0E34', 'fin.ar':'\u0E25\u0E39\u0E01\u0E04\u0E49\u0E32\u0E04\u0E49\u0E32\u0E07\u0E08\u0E48\u0E32\u0E22', 'fin.ap':'\u0E2B\u0E19\u0E35\u0E49\u0E04\u0E49\u0E32\u0E07\u0E08\u0E48\u0E32\u0E22', 'fin.revByPlatform':'\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49\u0E15\u0E32\u0E21\u0E0A\u0E48\u0E2D\u0E07\u0E17\u0E32\u0E07', 'fin.revShort':'\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49', 'fin.costMix':'\u0E42\u0E04\u0E23\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19', 'fin.health':'\u0E2A\u0E38\u0E02\u0E20\u0E32\u0E1E\u0E17\u0E32\u0E07\u0E01\u0E32\u0E23\u0E40\u0E07\u0E34\u0E19', 'fin.healthHint':'\u0E15\u0E31\u0E27\u0E40\u0E25\u0E02\u0E17\u0E35\u0E48\u0E04\u0E27\u0E23\u0E44\u0E25\u0E48\u0E15\u0E32\u0E21\u0E2D\u0E22\u0E39\u0E48\u0E40\u0E2A\u0E21\u0E2D (\u0E44\u0E21\u0E48\u0E02\u0E36\u0E49\u0E19\u0E01\u0E31\u0E1A\u0E0A\u0E48\u0E27\u0E07\u0E27\u0E31\u0E19\u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01)', 'fin.item':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23', 'fin.count':'\u0E08\u0E33\u0E19\u0E27\u0E19', 'fin.note':'\u0E2B\u0E21\u0E32\u0E22\u0E40\u0E2B\u0E15\u0E38', 'fin.hAr':'\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E22\u0E31\u0E07\u0E40\u0E01\u0E47\u0E1A\u0E40\u0E07\u0E34\u0E19\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49', 'fin.hArNote':'\u0E15\u0E32\u0E21\u0E40\u0E01\u0E47\u0E1A\u0E17\u0E35\u0E48\u0E2B\u0E19\u0E49\u0E32\u0E43\u0E1A\u0E41\u0E08\u0E49\u0E07\u0E2B\u0E19\u0E35\u0E49', 'fin.hAp':'\u0E2B\u0E19\u0E35\u0E49\u0E04\u0E48\u0E32\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32\u0E17\u0E35\u0E48\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E08\u0E48\u0E32\u0E22', 'fin.hApNote':'\u0E08\u0E31\u0E14\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E2B\u0E19\u0E49\u0E32 AP', 'fin.hStock':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E2A\u0E15\u0E4A\u0E2D\u0E01\u0E04\u0E07\u0E40\u0E2B\u0E25\u0E37\u0E2D', 'fin.hStockNote':'\u0E40\u0E07\u0E34\u0E19\u0E17\u0E35\u0E48\u0E08\u0E21\u0E2D\u0E22\u0E39\u0E48\u0E01\u0E31\u0E1A\u0E02\u0E2D\u0E07', 'fin.hLoss':'\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E02\u0E32\u0E14\u0E17\u0E38\u0E19', 'fin.hLossNote':'\u0E14\u0E39\u0E23\u0E32\u0E22\u0E25\u0E30\u0E40\u0E2D\u0E35\u0E22\u0E14\u0E17\u0E35\u0E48\u0E2B\u0E19\u0E49\u0E32\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E02\u0E32\u0E22', 'fin.hVat':'VAT \u0E17\u0E35\u0E48\u0E40\u0E01\u0E47\u0E1A\u0E08\u0E32\u0E01\u0E25\u0E39\u0E01\u0E04\u0E49\u0E32', 'fin.hVatNote':'\u0E44\u0E21\u0E48\u0E43\u0E0A\u0E48\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49\u0E02\u0E2D\u0E07\u0E23\u0E49\u0E32\u0E19', 'fin.statement':'\u0E07\u0E1A\u0E01\u0E33\u0E44\u0E23\u0E02\u0E32\u0E14\u0E17\u0E38\u0E19', 'fin.ofRevenue':'% \u0E02\u0E2D\u0E07\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49', 'fin.revenue':'\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49\u0E08\u0E32\u0E01\u0E01\u0E32\u0E23\u0E02\u0E32\u0E22', 'fin.sellingExp':'\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22\u0E43\u0E19\u0E01\u0E32\u0E23\u0E02\u0E32\u0E22', 'fin.afterSelling':'\u0E01\u0E33\u0E44\u0E23\u0E2B\u0E25\u0E31\u0E07\u0E2B\u0E31\u0E01\u0E04\u0E48\u0E32\u0E01\u0E32\u0E23\u0E02\u0E32\u0E22', 'fin.noOpex':'\u0E44\u0E21\u0E48\u0E21\u0E35\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22\u0E14\u0E33\u0E40\u0E19\u0E34\u0E19\u0E07\u0E32\u0E19\u0E43\u0E19\u0E0A\u0E48\u0E27\u0E07\u0E19\u0E35\u0E49', 'fin.revTrend':'\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49\u0E22\u0E49\u0E2D\u0E19\u0E2B\u0E25\u0E31\u0E07 6 \u0E40\u0E14\u0E37\u0E2D\u0E19', 'fin.netTrend':'\u0E01\u0E33\u0E44\u0E23\u0E2A\u0E38\u0E17\u0E18\u0E34\u0E22\u0E49\u0E2D\u0E19\u0E2B\u0E25\u0E31\u0E07 6 \u0E40\u0E14\u0E37\u0E2D\u0E19', 'fin.trendHint':'\u0E16\u0E49\u0E32\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49\u0E42\u0E15\u0E41\u0E15\u0E48\u0E01\u0E33\u0E44\u0E23\u0E44\u0E21\u0E48\u0E42\u0E15 \u0E41\u0E1B\u0E25\u0E27\u0E48\u0E32\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E01\u0E33\u0E25\u0E31\u0E07\u0E01\u0E34\u0E19\u0E01\u0E33\u0E44\u0E23', 'fin.byMonth':'\u0E2A\u0E23\u0E38\u0E1B\u0E23\u0E32\u0E22\u0E40\u0E14\u0E37\u0E2D\u0E19', 'fin.month':'\u0E40\u0E14\u0E37\u0E2D\u0E19', 'fin.movement':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23', 'fin.party':'\u0E04\u0E39\u0E48\u0E04\u0E49\u0E32', 'fin.in':'\u0E40\u0E07\u0E34\u0E19\u0E40\u0E02\u0E49\u0E32', 'fin.out':'\u0E40\u0E07\u0E34\u0E19\u0E2D\u0E2D\u0E01', 'fin.mCustomer':'\u0E23\u0E31\u0E1A\u0E08\u0E32\u0E01\u0E25\u0E39\u0E01\u0E04\u0E49\u0E32', 'fin.mSupplier':'\u0E08\u0E48\u0E32\u0E22\u0E04\u0E48\u0E32\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'fin.noMoves':'\u0E44\u0E21\u0E48\u0E21\u0E35\u0E01\u0E32\u0E23\u0E40\u0E04\u0E25\u0E37\u0E48\u0E2D\u0E19\u0E44\u0E2B\u0E27\u0E02\u0E2D\u0E07\u0E40\u0E07\u0E34\u0E19', 'fin.inTrend':'\u0E40\u0E07\u0E34\u0E19\u0E40\u0E02\u0E49\u0E32\u0E23\u0E32\u0E22\u0E40\u0E14\u0E37\u0E2D\u0E19', 'fin.outTrend':'\u0E40\u0E07\u0E34\u0E19\u0E2D\u0E2D\u0E01\u0E23\u0E32\u0E22\u0E40\u0E14\u0E37\u0E2D\u0E19', 'fin.cashHint':'\u0E40\u0E07\u0E34\u0E19\u0E2A\u0E14\u0E15\u0E48\u0E32\u0E07\u0E08\u0E32\u0E01\u0E01\u0E33\u0E44\u0E23 \u2014 \u0E02\u0E32\u0E22\u0E44\u0E14\u0E49\u0E41\u0E15\u0E48\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E40\u0E01\u0E47\u0E1A\u0E40\u0E07\u0E34\u0E19 \u0E01\u0E47\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E40\u0E02\u0E49\u0E32\u0E01\u0E23\u0E30\u0E40\u0E1B\u0E4B\u0E32', 'fin.vsProfit':'\u0E15\u0E48\u0E32\u0E07\u0E08\u0E32\u0E01\u0E01\u0E33\u0E44\u0E23', 'ox.payrollOf':'\u0E40\u0E07\u0E34\u0E19\u0E40\u0E14\u0E37\u0E2D\u0E19\u0E1E\u0E19\u0E31\u0E01\u0E07\u0E32\u0E19 \u2014 {m}', 'ox.autoRow':'\u0E23\u0E30\u0E1A\u0E1A\u0E25\u0E07\u0E43\u0E2B\u0E49\u0E08\u0E32\u0E01\u0E01\u0E32\u0E23\u0E2D\u0E19\u0E38\u0E21\u0E31\u0E15\u0E34\u0E40\u0E07\u0E34\u0E19\u0E40\u0E14\u0E37\u0E2D\u0E19 \u2014 \u0E41\u0E01\u0E49\u0E17\u0E35\u0E48\u0E19\u0E35\u0E48\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49', 'ox.category':'\u0E2B\u0E21\u0E27\u0E14', 'ox.details':'\u0E23\u0E32\u0E22\u0E25\u0E30\u0E40\u0E2D\u0E35\u0E22\u0E14', 'ox.amount':'\u0E08\u0E33\u0E19\u0E27\u0E19\u0E40\u0E07\u0E34\u0E19', 'ox.receipt':'\u0E43\u0E1A\u0E40\u0E2A\u0E23\u0E47\u0E08/\u0E2B\u0E25\u0E31\u0E01\u0E10\u0E32\u0E19', 'ox.add':'+ \u0E40\u0E1E\u0E34\u0E48\u0E21\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23', 'ox.addTitle':'\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E23\u0E32\u0E22\u0E08\u0E48\u0E32\u0E22\u0E43\u0E2B\u0E21\u0E48', 'ox.addHint':'\u0E01\u0E23\u0E2D\u0E01\u0E41\u0E25\u0E49\u0E27\u0E01\u0E14 Enter \u0E01\u0E47\u0E44\u0E14\u0E49 \u00B7 \u0E41\u0E01\u0E49\u0E43\u0E19\u0E15\u0E32\u0E23\u0E32\u0E07\u0E44\u0E14\u0E49\u0E40\u0E25\u0E22 \u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E17\u0E31\u0E19\u0E17\u0E35', 'ox.descPh':'\u0E08\u0E48\u0E32\u0E22\u0E04\u0E48\u0E32\u0E2D\u0E30\u0E44\u0E23', 'ox.count':'\u0E08\u0E33\u0E19\u0E27\u0E19\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23', 'ox.total':'\u0E23\u0E27\u0E21\u0E23\u0E32\u0E22\u0E08\u0E48\u0E32\u0E22', 'ox.avg':'\u0E40\u0E09\u0E25\u0E35\u0E48\u0E22\u0E15\u0E48\u0E2D\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23', 'ox.biggest':'\u0E2B\u0E21\u0E27\u0E14\u0E17\u0E35\u0E48\u0E08\u0E48\u0E32\u0E22\u0E21\u0E32\u0E01\u0E2A\u0E38\u0E14', 'ox.byCat':'\u0E23\u0E32\u0E22\u0E08\u0E48\u0E32\u0E22\u0E15\u0E32\u0E21\u0E2B\u0E21\u0E27\u0E14', 'ox.short':'\u0E23\u0E32\u0E22\u0E08\u0E48\u0E32\u0E22', 'ox.empty':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E21\u0E35\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23', 'ox.errAmount':'\u0E01\u0E23\u0E38\u0E13\u0E32\u0E43\u0E2A\u0E48\u0E08\u0E33\u0E19\u0E27\u0E19\u0E40\u0E07\u0E34\u0E19', 'ox.delConfirm':'\u0E25\u0E1A\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E19\u0E35\u0E49?', 'ap.status':'\u0E2A\u0E16\u0E32\u0E19\u0E30\u0E2B\u0E19\u0E35\u0E49', 'ap.unpaid':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E08\u0E48\u0E32\u0E22', 'ap.partial':'\u0E08\u0E48\u0E32\u0E22\u0E1A\u0E32\u0E07\u0E2A\u0E48\u0E27\u0E19', 'ap.paid':'\u0E08\u0E48\u0E32\u0E22\u0E04\u0E23\u0E1A', 'ap.proof':'\u0E2B\u0E25\u0E31\u0E01\u0E10\u0E32\u0E19\u0E01\u0E32\u0E23\u0E0A\u0E33\u0E23\u0E30\u0E2B\u0E19\u0E35\u0E49', 'ap.amount':'\u0E22\u0E2D\u0E14\u0E23\u0E27\u0E21', 'ap.entries':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E23\u0E31\u0E1A\u0E40\u0E02\u0E49\u0E32', 'ap.total':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E23\u0E27\u0E21', 'ap.owed':'\u0E22\u0E2D\u0E14\u0E04\u0E49\u0E32\u0E07\u0E08\u0E48\u0E32\u0E22', 'ap.settled':'\u0E08\u0E48\u0E32\u0E22\u0E41\u0E25\u0E49\u0E27', 'ap.empty':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E21\u0E35\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E40\u0E15\u0E34\u0E21\u0E2A\u0E15\u0E4A\u0E2D\u0E01', 'ap.clickHint':'\u0E04\u0E25\u0E34\u0E01\u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E40\u0E1B\u0E25\u0E35\u0E48\u0E22\u0E19\u0E2A\u0E16\u0E32\u0E19\u0E30', 'ap.unsaved':'\u0E21\u0E35\u0E01\u0E32\u0E23\u0E41\u0E01\u0E49\u0E44\u0E02\u0E17\u0E35\u0E48\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01', 'ap.confirmTitle':'\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E01\u0E32\u0E23\u0E40\u0E1B\u0E25\u0E35\u0E48\u0E22\u0E19\u0E41\u0E1B\u0E25\u0E07', 'ap.confirmBody':'\u0E22\u0E37\u0E19\u0E22\u0E31\u0E19\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01 {n} \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23?', 'confirm':'\u0E22\u0E37\u0E19\u0E22\u0E31\u0E19', 'nav.apList':'\u0E40\u0E08\u0E49\u0E32\u0E2B\u0E19\u0E35\u0E49 (AP)', 'nav.opExpense':'\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22\u0E14\u0E33\u0E40\u0E19\u0E34\u0E19\u0E07\u0E32\u0E19', 'nav.cogsTracking':'\u0E15\u0E34\u0E14\u0E15\u0E32\u0E21\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E02\u0E32\u0E22', 'sv.skus':'\u0E08\u0E33\u0E19\u0E27\u0E19\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'sv.units':'\u0E08\u0E33\u0E19\u0E27\u0E19\u0E0A\u0E34\u0E49\u0E19\u0E04\u0E07\u0E40\u0E2B\u0E25\u0E37\u0E2D', 'sv.atCost':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E15\u0E32\u0E21\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19', 'sv.atRetail':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E15\u0E32\u0E21\u0E23\u0E32\u0E04\u0E32\u0E02\u0E32\u0E22', 'sv.potential':'\u0E01\u0E33\u0E44\u0E23\u0E17\u0E35\u0E48\u0E04\u0E32\u0E14\u0E27\u0E48\u0E32\u0E08\u0E30\u0E44\u0E14\u0E49', 'sv.margin':'\u0E2D\u0E31\u0E15\u0E23\u0E32\u0E01\u0E33\u0E44\u0E23', 'sv.byCat':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E15\u0E32\u0E21\u0E2B\u0E21\u0E27\u0E14\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'sv.byOrigin':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E15\u0E32\u0E21\u0E41\u0E2B\u0E25\u0E48\u0E07\u0E17\u0E35\u0E48\u0E21\u0E32', 'sv.top':'\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32\u0E17\u0E35\u0E48\u0E08\u0E21\u0E17\u0E38\u0E19\u0E21\u0E32\u0E01\u0E17\u0E35\u0E48\u0E2A\u0E38\u0E14', 'sv.topHint':'\u0E40\u0E07\u0E34\u0E19\u0E01\u0E49\u0E2D\u0E19\u0E2D\u0E22\u0E39\u0E48\u0E17\u0E35\u0E48\u0E02\u0E2D\u0E07\u0E40\u0E2B\u0E25\u0E48\u0E32\u0E19\u0E35\u0E49\u0E21\u0E32\u0E01\u0E17\u0E35\u0E48\u0E2A\u0E38\u0E14 (5 \u0E2D\u0E31\u0E19\u0E14\u0E31\u0E1A\u0E41\u0E23\u0E01)', 'sv.onHand':'\u0E04\u0E07\u0E40\u0E2B\u0E25\u0E37\u0E2D', 'sv.avgCost':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19/\u0E0A\u0E34\u0E49\u0E19', 'sv.empty':'\u0E44\u0E21\u0E48\u0E21\u0E35\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32\u0E04\u0E07\u0E40\u0E2B\u0E25\u0E37\u0E2D', 'nav.stockValue':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E2A\u0E15\u0E4A\u0E2D\u0E01', 'cogs.pfee':'\u0E04\u0E48\u0E32\u0E18\u0E23\u0E23\u0E21\u0E40\u0E19\u0E35\u0E22\u0E21\u0E41\u0E1E\u0E25\u0E15\u0E1F\u0E2D\u0E23\u0E4C\u0E21', 'cogs.dfee':'\u0E04\u0E48\u0E32\u0E08\u0E31\u0E14\u0E2A\u0E48\u0E07\u0E08\u0E23\u0E34\u0E07', 'cogs.commission':'\u0E04\u0E48\u0E32\u0E04\u0E2D\u0E21', 'cogs.netProfit':'\u0E01\u0E33\u0E44\u0E23\u0E2B\u0E25\u0E31\u0E07\u0E2B\u0E31\u0E01\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22', 'comm.payout':'\u0E23\u0E39\u0E1B\u0E41\u0E1A\u0E1A\u0E01\u0E32\u0E23\u0E08\u0E48\u0E32\u0E22', 'comm.pool':'\u0E23\u0E27\u0E21\u0E41\u0E25\u0E49\u0E27\u0E2B\u0E32\u0E23\u0E40\u0E17\u0E48\u0E32\u0E01\u0E31\u0E19', 'comm.person':'\u0E41\u0E22\u0E01\u0E23\u0E32\u0E22\u0E1A\u0E38\u0E04\u0E04\u0E25', 'comm.payoutHint':'\u0E1C\u0E39\u0E01\u0E01\u0E31\u0E1A\u0E1E\u0E19\u0E31\u0E01\u0E07\u0E32\u0E19\u0E1B\u0E23\u0E30\u0E40\u0E20\u0E17 Salesperson', 'comm.sellerCount':'\u0E1E\u0E19\u0E31\u0E01\u0E07\u0E32\u0E19\u0E02\u0E32\u0E22\u0E02\u0E13\u0E30\u0E19\u0E35\u0E49', 'comm.base':'\u0E10\u0E32\u0E19\u0E01\u0E32\u0E23\u0E04\u0E33\u0E19\u0E27\u0E13', 'comm.baseGoods':'\u0E40\u0E09\u0E1E\u0E32\u0E30\u0E23\u0E32\u0E04\u0E32\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'comm.baseGoodsShip':'\u0E23\u0E27\u0E21\u0E04\u0E48\u0E32\u0E2A\u0E48\u0E07', 'comm.rates':'\u0E2D\u0E31\u0E15\u0E23\u0E32\u0E15\u0E32\u0E21\u0E2B\u0E21\u0E27\u0E14\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'comm.profitBase':'\u0E04\u0E33\u0E19\u0E27\u0E13\u0E08\u0E32\u0E01 \u0E01\u0E33\u0E44\u0E23 (\u0E22\u0E2D\u0E14\u0E02\u0E32\u0E22 \u2212 \u0E15\u0E49\u0E19\u0E17\u0E38\u0E19 \u2212 \u0E2A\u0E48\u0E27\u0E19\u0E25\u0E14 \u2212 \u0E04\u0E48\u0E32\u0E18\u0E23\u0E23\u0E21\u0E40\u0E19\u0E35\u0E22\u0E21) \u0E44\u0E21\u0E48\u0E43\u0E0A\u0E48\u0E22\u0E2D\u0E14\u0E02\u0E32\u0E22 \u00B7 \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E02\u0E32\u0E14\u0E17\u0E38\u0E19\u0E44\u0E21\u0E48\u0E04\u0E34\u0E14\u0E04\u0E48\u0E32\u0E04\u0E2D\u0E21', 'comm.ratesHint':'\u0E04\u0E48\u0E32\u0E40\u0E23\u0E34\u0E48\u0E21\u0E15\u0E49\u0E19 5% \u0E17\u0E38\u0E01\u0E2B\u0E21\u0E27\u0E14', 'comm.noCats':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E21\u0E35\u0E2B\u0E21\u0E27\u0E14\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'cogs.top':'\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32\u0E17\u0E33\u0E01\u0E33\u0E44\u0E23\u0E2A\u0E39\u0E07\u0E2A\u0E38\u0E14 10 \u0E2D\u0E31\u0E19\u0E14\u0E31\u0E1A', 'cogs.topHint':'\u0E01\u0E33\u0E44\u0E23\u0E02\u0E31\u0E49\u0E19\u0E15\u0E49\u0E19\u0E15\u0E48\u0E2D\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32 (\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E2B\u0E31\u0E01\u0E04\u0E48\u0E32\u0E18\u0E23\u0E23\u0E21\u0E40\u0E19\u0E35\u0E22\u0E21/\u0E04\u0E48\u0E32\u0E2A\u0E48\u0E07/\u0E04\u0E48\u0E32\u0E04\u0E2D\u0E21 \u0E40\u0E1E\u0E23\u0E32\u0E30\u0E40\u0E1B\u0E47\u0E19\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22\u0E23\u0E30\u0E14\u0E31\u0E1A\u0E1A\u0E34\u0E25)', 'cogs.sold':'\u0E02\u0E32\u0E22\u0E44\u0E14\u0E49 (\u0E0A\u0E34\u0E49\u0E19)', 'cogs.perBill':'\u0E23\u0E32\u0E22\u0E25\u0E30\u0E40\u0E2D\u0E35\u0E22\u0E14\u0E23\u0E32\u0E22\u0E1A\u0E34\u0E25', 'cogs.bills':'\u0E08\u0E33\u0E19\u0E27\u0E19\u0E1A\u0E34\u0E25', 'cogs.revenue':'\u0E22\u0E2D\u0E14\u0E02\u0E32\u0E22 (\u0E01\u0E48\u0E2D\u0E19 VAT)', 'cogs.total':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E02\u0E32\u0E22\u0E23\u0E27\u0E21', 'cogs.profit':'\u0E01\u0E33\u0E44\u0E23\u0E02\u0E31\u0E49\u0E19\u0E15\u0E49\u0E19', 'cogs.margin':'\u0E2D\u0E31\u0E15\u0E23\u0E32\u0E01\u0E33\u0E44\u0E23', 'cogs.byCat':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E15\u0E32\u0E21\u0E2B\u0E21\u0E27\u0E14\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'cogs.byOrigin':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E15\u0E32\u0E21\u0E41\u0E2B\u0E25\u0E48\u0E07\u0E17\u0E35\u0E48\u0E21\u0E32', 'cogs.byStatus':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19 \u0E0A\u0E33\u0E23\u0E30\u0E41\u0E25\u0E49\u0E27 vs \u0E04\u0E49\u0E32\u0E07\u0E0A\u0E33\u0E23\u0E30', 'cogs.paid':'\u0E0A\u0E33\u0E23\u0E30\u0E41\u0E25\u0E49\u0E27', 'cogs.unpaid':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E0A\u0E33\u0E23\u0E30', 'cogs.short':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19', 'cogs.barHint':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E17\u0E35\u0E48\u0E08\u0E21\u0E43\u0E19\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E22\u0E31\u0E07\u0E40\u0E01\u0E47\u0E1A\u0E40\u0E07\u0E34\u0E19\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49 = \u0E40\u0E07\u0E34\u0E19\u0E17\u0E35\u0E48\u0E08\u0E48\u0E32\u0E22\u0E44\u0E1B\u0E41\u0E25\u0E49\u0E27\u0E41\u0E15\u0E48\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32', 'cogs.missing':'\u0E21\u0E35 {n} \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E23\u0E30\u0E1A\u0E38 lot \u0E15\u0E49\u0E19\u0E17\u0E38\u0E19 \u2014 \u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E17\u0E35\u0E48\u0E41\u0E2A\u0E14\u0E07\u0E2D\u0E32\u0E08\u0E15\u0E48\u0E33\u0E01\u0E27\u0E48\u0E32\u0E08\u0E23\u0E34\u0E07', 'inv.byStatus':'\u0E41\u0E22\u0E01\u0E15\u0E32\u0E21\u0E2A\u0E16\u0E32\u0E19\u0E30\u0E1A\u0E34\u0E25', 'inv.bills':'\u0E1A\u0E34\u0E25', 'inv.billed':'\u0E22\u0E2D\u0E14\u0E23\u0E27\u0E21\u0E17\u0E35\u0E48\u0E2D\u0E2D\u0E01\u0E1A\u0E34\u0E25', 'inv.received':'\u0E23\u0E31\u0E1A\u0E21\u0E32\u0E41\u0E25\u0E49\u0E27 (\u0E21\u0E31\u0E14\u0E08\u0E33)', 'inv.unpaid':'\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E23\u0E31\u0E1A\u0E0A\u0E33\u0E23\u0E30', 'inv.empty':'\u0E44\u0E21\u0E48\u0E21\u0E35\u0E1A\u0E34\u0E25\u0E04\u0E49\u0E32\u0E07\u0E0A\u0E33\u0E23\u0E30', 'nav.orderHistory':'ประวัติแก้ไข', 'eh.record':'รายการ', 'eh.changes':'จำนวนครั้ง', 'eh.lastAction':'ล่าสุด', 'eh.lastEdited':'แก้ล่าสุด', 'eh.when':'วันเวลา', 'eh.by':'ผู้ทำ', 'eh.action':'การกระทำ', 'eh.viewRaw':'ดูข้อมูลดิบ', 'eh.back':'กลับ', 'eh.empty':'ยังไม่มีประวัติ', 'eh.rawTitle':'ข้อมูล ณ ตอนนั้น (raw)', 'eh.create':'สร้าง', 'eh.edit':'แก้ไข', 'eh.delete':'ลบ', 'eh.imgChanges':'\u0E01\u0E32\u0E23\u0E40\u0E1B\u0E25\u0E35\u0E48\u0E22\u0E19\u0E41\u0E1B\u0E25\u0E07\u0E23\u0E39\u0E1B', 'eh.imgAdded':'\u0E40\u0E1E\u0E34\u0E48\u0E21\u0E23\u0E39\u0E1B', 'eh.imgRemoved':'\u0E25\u0E1A\u0E23\u0E39\u0E1B', 'eh.imgNoName':'(\u0E44\u0E21\u0E48\u0E17\u0E23\u0E32\u0E1A\u0E0A\u0E37\u0E48\u0E2D\u0E44\u0E1F\u0E25\u0E4C)', 'eh.old':'เดิม', 'eh.new':'ใหม่', 'eh.viewDetail':'ดูรายละเอียด', 'eh.items':'รายการสินค้า', 'eh.note':'หมายเหตุ', 'del.empty':'ยังไม่มีรายการจัดส่ง', 'set.deliveryStatuses':'สถานะการจัดส่ง', 'set.shippingTypes':'ประเภทการจัดส่ง (Shipping Type)', 'set.outsources':'ผู้ให้บริการ Outsource', 'set.regionMode':'รูปแบบการแบ่งภูมิภาค', 'nav.grouping':'การจัดกลุ่ม', 'nav.shippingCost':'ค่าจัดส่ง', 'nav.deliveryList':'รายการจัดส่ง', 'nav.deliveryBoard':'สถานะการจัดส่ง', 'nav.deliveryCalendar':'ปฏิทิน', 'nav.profile':'องค์กร', 'nav.profileGeneral':'ร้านค้าทั่วไป', 'bp.titleGeneral':'ข้อมูลร้านค้าทั่วไป (สำหรับออกเอกสาร)', 'bp.descGeneral':'ใช้เป็นหัวเอกสารของบิลที่ไม่ติ๊ก VAT — ไม่มีเลขประจำตัวผู้เสียภาษี', 'bp.descOrg':'ใช้เป็นหัวเอกสารของบิลที่ติ๊ก VAT (ใบกำกับภาษี)', 'cal.driverType':'ประเภทคนขับ', 'cal.driver':'คนขับ', 'cal.allTypes':'ทุกประเภท', 'cal.allDrivers':'ทุกคน', 'cal.today':'วันนี้', 'cal.unscheduled':'ยังไม่กำหนดวัน {n} รายการ', 'cal.pickTitle':'เลือกรายการที่จะส่งวันนี้', 'cal.pickNone':'ยังไม่มีรายการจัดส่งให้เลือก', 'cal.pickAllAssigned':'ทุกรายการถูกกำหนดวันไปหมดแล้ว', 'cal.colorBy':'สีตาม', 'cal.byStatus':'สถานะ', 'cal.byType':'ประเภทคนขับ', 'cal.byDriver':'ชื่อคนขับ', 'nav.deliveryDrivers':'คนขับ', 'drv.title':'สีของคนขับ', 'drv.desc':'ตั้งสีให้คนขับแต่ละคน — ใช้แสดงในปฏิทินเมื่อเลือกสีตามคนขับ', 'drv.our':'คนขับของร้าน', 'drv.outsource':'Outsource', 'drv.empty':'ยังไม่มีคนขับ (เพิ่มพนักงานประเภท Delivery Driver หรือ Outsource ก่อน)', 'set.shipCost':'ค่าจัดส่ง', 'set.shipCategory':'ประเภทสินค้า (Category)', 'set.shipCostDesc':'ตั้งราคาค่าจัดส่ง — ตามภาค (4/6) หรือรายจังหวัด', 'set.shipMode':'รูปแบบการคิดราคา', 'set.shipByProvince':'รายจังหวัด', 'set.shipProvSwitch':'วิธีตั้งราคารายจังหวัด', 'set.shipException':'ตามภาค + ยกเว้นบางจังหวัด', 'set.shipManual':'ตั้งเองทุกจังหวัด', 'set.shipPickRegion':'เลือกภาค (เพื่อตั้งราคาจังหวัดในภาคนั้น)', 'set.shipRegionBase':'ราคาฐานของภาค', 'set.baht':'บาท', 'set.region4':'4 ภาค', 'set.region6':'6 ภาค', 'set.regionModeHint':'เลือกวิธีแบ่งภูมิภาค — มีผลกับคอลัมน์/ตัวกรอง "ภาค" ในหน้าจัดส่ง และสีแบ่งภาคบนแผนที่ (ไม่ต้องเก็บข้อมูลซ้ำ เพราะภาคคำนวณจากรหัสจังหวัด)',
+      'rev.invoiceNo': 'เลขบิล', 'col.lastEdited':'แก้ล่าสุด', 'rev.customer': 'ชื่อผู้รับ', 'rev.customerHint': 'ชื่อ-นามสกุลผู้รับ', 'rev.back':'กลับ', 'rev.mapHint':'หรือกดเลือกจังหวัดจากแผนที่', 'rev.selProvince':'จังหวัดที่เลือก', 'rev.noProvince':'ยังไม่ได้เลือกจังหวัด', 'region.north':'ภาคเหนือ', 'region.central':'ภาคกลาง', 'region.northeast':'ภาคตะวันออกเฉียงเหนือ', 'region.east':'ภาคตะวันออก', 'region.west':'ภาคตะวันตก', 'region.south':'ภาคใต้', 'rev.address': 'ที่อยู่ผู้รับ', 'rev.addressHint': 'ที่อยู่สำหรับจัดส่ง', 'rev.addrLine':'ที่อยู่ (บ้านเลขที่/หมู่/ซอย/ถนน)', 'rev.addrLineHint':'บ้านเลขที่ หมู่ ตรอก/ซอย ถนน', 'rev.province':'จังหวัด', 'rev.district':'อำเภอ/เขต', 'rev.subdistrict':'ตำบล/แขวง', 'rev.postal':'รหัสไปรษณีย์', 'rev.postalHint':'อัตโนมัติ', 'rev.loading':'กำลังโหลด...', 'rev.errAddrLine':'กรุณากรอกที่อยู่ (บ้านเลขที่/ซอย/ถนน)', 'rev.errAddrGeo':'กรุณาเลือกจังหวัด/อำเภอ/ตำบลให้ครบ', 'sec.seller':'\u0E1C\u0E39\u0E49\u0E2D\u0E2D\u0E01\u0E1A\u0E34\u0E25 (Seller)', 'sell.issuedBy':'\u0E2D\u0E2D\u0E01\u0E1A\u0E34\u0E25\u0E42\u0E14\u0E22', 'sell.signature':'\u0E25\u0E32\u0E22\u0E40\u0E0B\u0E47\u0E19', 'sell.clear':'\u0E25\u0E49\u0E32\u0E07', 'sell.upload':'\u0E2D\u0E31\u0E1B\u0E42\u0E2B\u0E25\u0E14\u0E23\u0E39\u0E1B\u0E25\u0E32\u0E22\u0E40\u0E0B\u0E47\u0E19', 'sell.signHint':'วาดในกรอบ หรืออัปโหลดรูป', 'sell.errSign':'\u0E01\u0E23\u0E38\u0E13\u0E32\u0E40\u0E0B\u0E47\u0E19\u0E0A\u0E37\u0E48\u0E2D\u0E01\u0E48\u0E2D\u0E19\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01', 'sell.seller':'\u0E1C\u0E39\u0E49\u0E2D\u0E2D\u0E01\u0E1A\u0E34\u0E25', 'rev.platformFee':'\u0E04\u0E48\u0E32\u0E18\u0E23\u0E23\u0E21\u0E40\u0E19\u0E35\u0E22\u0E21\u0E41\u0E1E\u0E25\u0E15\u0E1F\u0E2D\u0E23\u0E4C\u0E21', 'rev.platform': 'ขายผ่าน Platform', 'rev.platformHint': 'เช่น TikTok Shop', 'sec.delivery':'การจัดส่ง', 'sec.inventory':'รายการสินค้า (Inventory)', 'rev.phone':'เบอร์โทรติดต่อ', 'rev.phoneHint':'เบอร์โทรศัพท์ผู้รับ', 'rev.shippingTitle':'ค่าจัดส่ง', 'rev.shippingCost':'ค่าจัดส่ง', 'rev.shippingOverride':'ตั้งค่าส่งเอง (ทับ auto)', 'rev.shipAuto':'อัตโนมัติ', 'rev.shipNoCat':'ยังไม่มีสินค้า/หมวดหมู่', 'sec.vat':'\u0E01\u0E32\u0E23\u0E04\u0E33\u0E19\u0E27\u0E13 VAT', 'sec.payment':'\u0E01\u0E32\u0E23\u0E0A\u0E33\u0E23\u0E30\u0E40\u0E07\u0E34\u0E19', 'pay.mode':'\u0E27\u0E34\u0E18\u0E35\u0E0A\u0E33\u0E23\u0E30\u0E40\u0E07\u0E34\u0E19', 'pay.paid':'\u0E0A\u0E33\u0E23\u0E30\u0E41\u0E25\u0E49\u0E27 (\u0E21\u0E31\u0E14\u0E08\u0E33)', 'pay.vatable':'\u0E1A\u0E34\u0E25\u0E19\u0E35\u0E49\u0E04\u0E34\u0E14 VAT 7% (\u0E1A\u0E27\u0E01\u0E40\u0E1E\u0E34\u0E48\u0E21\u0E08\u0E32\u0E01\u0E22\u0E2D\u0E14\u0E2A\u0E38\u0E17\u0E18\u0E34)', 'pay.vat':'VAT', 'pay.vatSeparated':'\u0E41\u0E22\u0E01\u0E1A\u0E34\u0E25 (VAT 7%)', 'pay.vatYes':'VAT 7%', 'pay.noProof':'\u0E1A\u0E34\u0E25\u0E19\u0E35\u0E49\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E41\u0E19\u0E1A\u0E2B\u0E25\u0E31\u0E01\u0E10\u0E32\u0E19', 'pay.proof':'\u0E2B\u0E25\u0E31\u0E01\u0E10\u0E32\u0E19\u0E01\u0E32\u0E23\u0E0A\u0E33\u0E23\u0E30\u0E40\u0E07\u0E34\u0E19', 'pay.proofHint':'แนบได้หลายไฟล์', 'pay.download':'\u0E14\u0E32\u0E27\u0E19\u0E4C\u0E42\u0E2B\u0E25\u0E14', 'pay.pending':'\u0E22\u0E2D\u0E14\u0E04\u0E49\u0E32\u0E07\u0E0A\u0E33\u0E23\u0E30', 'set.colTh':'\u0E0A\u0E37\u0E48\u0E2D\u0E20\u0E32\u0E29\u0E32\u0E44\u0E17\u0E22 (TH)', 'set.colEn':'\u0E0A\u0E37\u0E48\u0E2D\u0E20\u0E32\u0E29\u0E32\u0E2D\u0E31\u0E07\u0E01\u0E24\u0E29 (EN)', 'set.colFee':'\u0E04\u0E48\u0E32\u0E18\u0E23\u0E23\u0E21\u0E40\u0E19\u0E35\u0E22\u0E21 %', 'set.colColor':'\u0E2A\u0E35', 'set.expenseCategories':'\u0E2B\u0E21\u0E27\u0E14\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22 (Expense Category)', 'set.platforms':'\u0E0A\u0E48\u0E2D\u0E07\u0E17\u0E32\u0E07\u0E01\u0E32\u0E23\u0E02\u0E32\u0E22 (Platform)', 'set.feeHint':'\u0E04\u0E48\u0E32\u0E18\u0E23\u0E23\u0E21\u0E40\u0E19\u0E35\u0E22\u0E21\u0E41\u0E1E\u0E25\u0E15\u0E1F\u0E2D\u0E23\u0E4C\u0E21 (%)', 'set.paymentModes':'\u0E27\u0E34\u0E18\u0E35\u0E0A\u0E33\u0E23\u0E30\u0E40\u0E07\u0E34\u0E19', 'rev.discountsTitle':'ส่วนลด', 'rev.itemDiscount':'ส่วนลดสินค้า', 'rev.shippingDiscount':'ส่วนลดค่าส่ง', 'rev.overallDiscount':'ส่วนลดรวมทั้งบิล', 'rev.totalDiscount':'ส่วนลดรวม', 'rev.deliveryMethod':'วิธีจัดส่ง', 'rev.responsible':'ผู้รับผิดชอบ', 'rev.pickResp':'— เลือก —', 'rev.respHint':'ระบุผู้รับผิดชอบ', 'rev.proofLabel':'หลักฐานการจัดส่ง (Outsource)', 'rev.proofPick':'แนบไฟล์', 'rev.proofAttached':'แนบแล้ว', 'rev.proofNone':'ยังไม่ได้แนบ', 'rev.items': 'รายการสินค้า', 'del.allProvinces':'ทุกจังหวัด', 'del.allRegions':'ทุกภาค', 'del.allStatuses':'ทุกสถานะ', 'del.orderNo':'เลขที่ออเดอร์', 'del.recipient':'ผู้รับ', 'del.province':'จังหวัด', 'del.region':'ภาค', 'del.address':'ที่อยู่', 'del.status':'สถานะจัดส่ง', 'del.shipType':'วิธีจัดส่ง', 'del.responsible':'ผู้รับผิดชอบ', 'del.proof':'หลักฐาน', 'del.verified':'ยืนยัน', 'del.deliveryDate':'วันจัดส่ง', 'nav.productHistory':'ประวัติแก้ไข', 'nav.invoicing':'\u0E43\u0E1A\u0E41\u0E08\u0E49\u0E07\u0E2B\u0E19\u0E35\u0E49', 'nav.arStatus':'\u0E2A\u0E16\u0E32\u0E19\u0E30\u0E25\u0E39\u0E01\u0E2B\u0E19\u0E35\u0E49 (AR)', 'nav.receipts':'\u0E43\u0E1A\u0E40\u0E2A\u0E23\u0E47\u0E08', 'rc.avg':'\u0E40\u0E09\u0E25\u0E35\u0E48\u0E22\u0E15\u0E48\u0E2D\u0E43\u0E1A', 'inv.deposit':'\u0E21\u0E31\u0E14\u0E08\u0E33\u0E17\u0E35\u0E48\u0E23\u0E31\u0E1A\u0E21\u0E32\u0E41\u0E25\u0E49\u0E27', 'rc.count':'\u0E08\u0E33\u0E19\u0E27\u0E19\u0E43\u0E1A\u0E40\u0E2A\u0E23\u0E47\u0E08', 'rc.total':'\u0E22\u0E2D\u0E14\u0E23\u0E27\u0E21', 'rc.byMode':'\u0E41\u0E22\u0E01\u0E15\u0E32\u0E21\u0E0A\u0E48\u0E2D\u0E07\u0E17\u0E32\u0E07\u0E0A\u0E33\u0E23\u0E30', 'rc.receipts':'\u0E43\u0E1A\u0E40\u0E2A\u0E23\u0E47\u0E08', 'rc.empty':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E21\u0E35\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E0A\u0E33\u0E23\u0E30\u0E41\u0E25\u0E49\u0E27', 'se.delivery':'\u0E04\u0E48\u0E32\u0E2A\u0E48\u0E07\u0E08\u0E23\u0E34\u0E07', 'se.other':'\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22\u0E2D\u0E37\u0E48\u0E19', 'se.status':'\u0E2A\u0E16\u0E32\u0E19\u0E30', 'se.added':'\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E41\u0E25\u0E49\u0E27', 'se.none':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01', 'se.addNote':'\u0E40\u0E1E\u0E34\u0E48\u0E21\u0E42\u0E19\u0E49\u0E15', 'nav.sellingExpenses':'\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22\u0E43\u0E19\u0E01\u0E32\u0E23\u0E02\u0E32\u0E22', 'ap.mass':'\u0E15\u0E31\u0E49\u0E07\u0E08\u0E48\u0E32\u0E22\u0E04\u0E23\u0E1A\u0E17\u0E31\u0E49\u0E07\u0E2B\u0E21\u0E14', 'ap.massBody':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E31\u0E49\u0E07 {n} \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E01\u0E23\u0E2D\u0E07\u0E2D\u0E22\u0E39\u0E48\u0E15\u0E2D\u0E19\u0E19\u0E35\u0E49 \u0E08\u0E30\u0E16\u0E39\u0E01\u0E15\u0E31\u0E49\u0E07\u0E40\u0E1B\u0E47\u0E19 \u0E08\u0E48\u0E32\u0E22\u0E04\u0E23\u0E1A + \u0E22\u0E37\u0E19\u0E22\u0E31\u0E19 \u0E41\u0E25\u0E30\u0E2B\u0E25\u0E31\u0E01\u0E10\u0E32\u0E19\u0E17\u0E35\u0E48\u0E41\u0E19\u0E1A\u0E08\u0E30\u0E16\u0E39\u0E01\u0E43\u0E2A\u0E48\u0E43\u0E2B\u0E49\u0E17\u0E38\u0E01\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23 \u00B7 \u0E22\u0E31\u0E07\u0E15\u0E49\u0E2D\u0E07\u0E01\u0E14 Save \u0E2D\u0E35\u0E01\u0E04\u0E23\u0E31\u0E49\u0E07\u0E08\u0E36\u0E07\u0E08\u0E30\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01', 'ap.paidAmount':'\u0E08\u0E48\u0E32\u0E22\u0E44\u0E1B\u0E41\u0E25\u0E49\u0E27', 'ap.mass':'\u0E15\u0E31\u0E49\u0E07\u0E08\u0E48\u0E32\u0E22\u0E04\u0E23\u0E1A\u0E17\u0E31\u0E49\u0E07\u0E2B\u0E21\u0E14', 'ap.massBody':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E01\u0E23\u0E2D\u0E07\u0E44\u0E27\u0E49\u0E15\u0E2D\u0E19\u0E19\u0E35\u0E49 {n} \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23 ({amt} \u0E3F) \u0E08\u0E30\u0E16\u0E39\u0E01\u0E15\u0E31\u0E49\u0E07\u0E40\u0E1B\u0E47\u0E19 \u0E08\u0E48\u0E32\u0E22\u0E04\u0E23\u0E1A \u0E41\u0E25\u0E30 \u0E22\u0E37\u0E19\u0E22\u0E31\u0E19\u0E41\u0E25\u0E49\u0E27 \u0E17\u0E31\u0E49\u0E07\u0E2B\u0E21\u0E14', 'ap.massProofHint':'\u0E44\u0E1F\u0E25\u0E4C\u0E17\u0E35\u0E48\u0E41\u0E19\u0E1A\u0E08\u0E30\u0E16\u0E39\u0E01\u0E43\u0E2A\u0E48\u0E43\u0E2B\u0E49\u0E17\u0E38\u0E01\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23 (\u0E44\u0E21\u0E48\u0E43\u0E2A\u0E48\u0E01\u0E47\u0E44\u0E14\u0E49)', 'ox.updatedBy':'\u0E2D\u0E31\u0E1B\u0E40\u0E14\u0E15\u0E42\u0E14\u0E22', 'nav.opexHistory':'\u0E1B\u0E23\u0E30\u0E27\u0E31\u0E15\u0E34\u0E41\u0E01\u0E49\u0E44\u0E02', 'nav.finOverview':'\u0E20\u0E32\u0E1E\u0E23\u0E27\u0E21', 'nav.pnl':'\u0E01\u0E33\u0E44\u0E23\u0E02\u0E32\u0E14\u0E17\u0E38\u0E19 (P&L)', 'nav.cashFlow':'\u0E01\u0E23\u0E30\u0E41\u0E2A\u0E40\u0E07\u0E34\u0E19\u0E2A\u0E14', 'nav.taxReport':'\u0E23\u0E32\u0E22\u0E07\u0E32\u0E19\u0E20\u0E32\u0E29\u0E35\u0E02\u0E32\u0E22', 'tax.modeVat':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E04\u0E34\u0E14 VAT', 'tax.modeNoVat':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E44\u0E21\u0E48\u0E04\u0E34\u0E14 VAT', 'tax.invoices':'\u0E43\u0E1A\u0E01\u0E33\u0E01\u0E31\u0E1A\u0E20\u0E32\u0E29\u0E35', 'tax.billsNoVat':'\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E44\u0E21\u0E48\u0E04\u0E34\u0E14 VAT', 'tax.base':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E01\u0E48\u0E2D\u0E19 VAT', 'tax.output':'\u0E20\u0E32\u0E29\u0E35\u0E02\u0E32\u0E22 (VAT 7%)', 'tax.grand':'\u0E23\u0E27\u0E21\u0E17\u0E31\u0E49\u0E07\u0E2A\u0E34\u0E49\u0E19', 'tax.byMonth':'\u0E2A\u0E23\u0E38\u0E1B\u0E23\u0E32\u0E22\u0E40\u0E14\u0E37\u0E2D\u0E19 (\u0E2A\u0E33\u0E2B\u0E23\u0E31\u0E1A\u0E22\u0E37\u0E48\u0E19)', 'tax.detail':'\u0E23\u0E32\u0E22\u0E25\u0E30\u0E40\u0E2D\u0E35\u0E22\u0E14\u0E43\u0E1A\u0E01\u0E33\u0E01\u0E31\u0E1A\u0E20\u0E32\u0E29\u0E35', 'tax.detailNoVat':'\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2D\u0E22\u0E39\u0E48\u0E43\u0E19\u0E23\u0E32\u0E22\u0E07\u0E32\u0E19', 'tax.issuer':'\u0E1C\u0E39\u0E49\u0E2D\u0E2D\u0E01\u0E43\u0E1A\u0E01\u0E33\u0E01\u0E31\u0E1A', 'tax.empty':'\u0E44\u0E21\u0E48\u0E21\u0E35\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E43\u0E19\u0E0A\u0E48\u0E27\u0E07\u0E19\u0E35\u0E49', 'tax.hint':'\u0E14\u0E36\u0E07\u0E40\u0E09\u0E1E\u0E32\u0E30\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E15\u0E34\u0E4A\u0E01 VAT \u0E44\u0E27\u0E49 \u00B7 \u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E41\u0E22\u0E01\u0E04\u0E48\u0E32\u0E2A\u0E48\u0E07 \u0E04\u0E48\u0E32\u0E2A\u0E48\u0E07\u0E44\u0E21\u0E48\u0E2D\u0E22\u0E39\u0E48\u0E43\u0E19\u0E10\u0E32\u0E19\u0E20\u0E32\u0E29\u0E35 \u00B7 \u0E23\u0E32\u0E22\u0E07\u0E32\u0E19\u0E19\u0E35\u0E49\u0E40\u0E1B\u0E47\u0E19\u0E20\u0E32\u0E29\u0E35\u0E02\u0E32\u0E22\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E40\u0E14\u0E35\u0E22\u0E27 \u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2B\u0E31\u0E01\u0E20\u0E32\u0E29\u0E35\u0E0B\u0E37\u0E49\u0E2D', 'tax.hintNoVat':'\u0E1A\u0E34\u0E25\u0E40\u0E2B\u0E25\u0E48\u0E32\u0E19\u0E35\u0E49\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E19\u0E31\u0E1A\u0E43\u0E19\u0E23\u0E32\u0E22\u0E07\u0E32\u0E19\u0E20\u0E32\u0E29\u0E35\u0E02\u0E32\u0E22 \u2014 \u0E14\u0E39\u0E44\u0E27\u0E49\u0E40\u0E1C\u0E37\u0E48\u0E2D\u0E15\u0E23\u0E27\u0E08\u0E27\u0E48\u0E32\u0E25\u0E37\u0E21\u0E15\u0E34\u0E4A\u0E01 VAT \u0E2B\u0E23\u0E37\u0E2D\u0E44\u0E21\u0E48', 'cd.noteTitle':'\u0E2B\u0E21\u0E32\u0E22\u0E40\u0E2B\u0E15\u0E38\u0E1A\u0E19\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23', 'cd.noteHint':'\u0E02\u0E49\u0E2D\u0E04\u0E27\u0E32\u0E21\u0E19\u0E35\u0E49\u0E40\u0E1B\u0E47\u0E19 \u0E04\u0E48\u0E32\u0E15\u0E31\u0E49\u0E07\u0E15\u0E49\u0E19 \u0E17\u0E35\u0E48\u0E08\u0E30\u0E16\u0E39\u0E01\u0E40\u0E15\u0E34\u0E21\u0E43\u0E2B\u0E49\u0E2D\u0E31\u0E15\u0E42\u0E19\u0E21\u0E31\u0E15\u0E34\u0E43\u0E19\u0E0A\u0E48\u0E2D\u0E07 \u0E2B\u0E21\u0E32\u0E22\u0E40\u0E2B\u0E15\u0E38 \u0E15\u0E2D\u0E19\u0E2A\u0E23\u0E49\u0E32\u0E1A\u0E34\u0E25\u0E43\u0E2B\u0E21\u0E48 \u2014 \u0E41\u0E01\u0E49\u0E23\u0E32\u0E22\u0E1A\u0E34\u0E25\u0E44\u0E14\u0E49 \u0E41\u0E25\u0E30\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23\u0E08\u0E30\u0E1E\u0E34\u0E21\u0E1E\u0E4C\u0E15\u0E32\u0E21\u0E17\u0E35\u0E48\u0E23\u0E30\u0E1A\u0E38\u0E43\u0E19\u0E1A\u0E34\u0E25\u0E19\u0E31\u0E49\u0E19', 'cd.notePh':'\u0E40\u0E0A\u0E48\u0E19 \u0E40\u0E07\u0E37\u0E48\u0E2D\u0E19\u0E44\u0E02\u0E01\u0E32\u0E23\u0E23\u0E31\u0E1A\u0E1B\u0E23\u0E30\u0E01\u0E31\u0E19 \u0E27\u0E34\u0E18\u0E35\u0E14\u0E39\u0E41\u0E25\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32 \u0E0A\u0E48\u0E2D\u0E07\u0E17\u0E32\u0E07\u0E15\u0E34\u0E14\u0E15\u0E48\u0E2D', 'cd.saved':'\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E41\u0E25\u0E49\u0E27', 'cd.previewTitle':'\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E17\u0E35\u0E48\u0E08\u0E30\u0E41\u0E2A\u0E14\u0E07', 'cd.previewHint':'\u0E02\u0E49\u0E2D\u0E04\u0E27\u0E32\u0E21\u0E19\u0E35\u0E49\u0E08\u0E30\u0E27\u0E32\u0E07\u0E40\u0E2B\u0E19\u0E37\u0E2D\u0E0A\u0E48\u0E2D\u0E07\u0E25\u0E32\u0E22\u0E40\u0E0B\u0E47\u0E19\u0E43\u0E19\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23', 'cd.previewEmpty':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E43\u0E2A\u0E48\u0E2B\u0E21\u0E32\u0E22\u0E40\u0E2B\u0E15\u0E38', 'rev.remarkHint':'\u0E1E\u0E34\u0E21\u0E1E\u0E4C\u0E1A\u0E19\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23 \u00B7 \u0E40\u0E23\u0E34\u0E48\u0E21\u0E08\u0E32\u0E01\u0E04\u0E48\u0E32\u0E15\u0E31\u0E49\u0E07\u0E15\u0E49\u0E19\u0E43\u0E19\u0E2B\u0E19\u0E49\u0E32\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23\u0E25\u0E39\u0E01\u0E04\u0E49\u0E32 \u0E41\u0E01\u0E49\u0E44\u0E14\u0E49\u0E15\u0E48\u0E32\u0E07\u0E2B\u0E32\u0E01\u0E1A\u0E34\u0E25', 'rev.noteHint':'\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E20\u0E32\u0E22\u0E43\u0E19 \u0E44\u0E21\u0E48\u0E02\u0E36\u0E49\u0E19\u0E1A\u0E19\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23', 'noAccess':'\u0E1A\u0E17\u0E1A\u0E32\u0E17\u0E19\u0E35\u0E49\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E23\u0E31\u0E1A\u0E2A\u0E34\u0E17\u0E18\u0E34\u0E4C\u0E40\u0E02\u0E49\u0E32\u0E16\u0E36\u0E07\u0E2B\u0E19\u0E49\u0E32\u0E19\u0E35\u0E49', 'cd.remark':'\u0E2B\u0E21\u0E32\u0E22\u0E40\u0E2B\u0E15\u0E38', 'fin.allTime':'\u0E17\u0E31\u0E49\u0E07\u0E2B\u0E21\u0E14', 'fin.custom':'\u0E01\u0E33\u0E2B\u0E19\u0E14\u0E40\u0E2D\u0E07', 'fin.thisMonth':'\u0E40\u0E14\u0E37\u0E2D\u0E19\u0E19\u0E35\u0E49', 'fin.netProfit':'\u0E01\u0E33\u0E44\u0E23\u0E2A\u0E38\u0E17\u0E18\u0E34', 'fin.cashIn':'\u0E40\u0E07\u0E34\u0E19\u0E40\u0E02\u0E49\u0E32\u0E08\u0E23\u0E34\u0E07', 'fin.cashOut':'\u0E40\u0E07\u0E34\u0E19\u0E2D\u0E2D\u0E01\u0E08\u0E23\u0E34\u0E07', 'fin.cashNet':'\u0E40\u0E07\u0E34\u0E19\u0E2A\u0E14\u0E2A\u0E38\u0E17\u0E18\u0E34', 'fin.ar':'\u0E25\u0E39\u0E01\u0E04\u0E49\u0E32\u0E04\u0E49\u0E32\u0E07\u0E08\u0E48\u0E32\u0E22', 'fin.ap':'\u0E2B\u0E19\u0E35\u0E49\u0E04\u0E49\u0E32\u0E07\u0E08\u0E48\u0E32\u0E22', 'fin.revByPlatform':'\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49\u0E15\u0E32\u0E21\u0E0A\u0E48\u0E2D\u0E07\u0E17\u0E32\u0E07', 'fin.revShort':'\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49', 'fin.costMix':'\u0E42\u0E04\u0E23\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19', 'fin.health':'\u0E2A\u0E38\u0E02\u0E20\u0E32\u0E1E\u0E17\u0E32\u0E07\u0E01\u0E32\u0E23\u0E40\u0E07\u0E34\u0E19', 'fin.healthHint':'\u0E15\u0E31\u0E27\u0E40\u0E25\u0E02\u0E17\u0E35\u0E48\u0E04\u0E27\u0E23\u0E44\u0E25\u0E48\u0E15\u0E32\u0E21\u0E2D\u0E22\u0E39\u0E48\u0E40\u0E2A\u0E21\u0E2D (\u0E44\u0E21\u0E48\u0E02\u0E36\u0E49\u0E19\u0E01\u0E31\u0E1A\u0E0A\u0E48\u0E27\u0E07\u0E27\u0E31\u0E19\u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01)', 'fin.item':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23', 'fin.count':'\u0E08\u0E33\u0E19\u0E27\u0E19', 'fin.note':'\u0E2B\u0E21\u0E32\u0E22\u0E40\u0E2B\u0E15\u0E38', 'fin.hAr':'\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E22\u0E31\u0E07\u0E40\u0E01\u0E47\u0E1A\u0E40\u0E07\u0E34\u0E19\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49', 'fin.hArNote':'\u0E15\u0E32\u0E21\u0E40\u0E01\u0E47\u0E1A\u0E17\u0E35\u0E48\u0E2B\u0E19\u0E49\u0E32\u0E43\u0E1A\u0E41\u0E08\u0E49\u0E07\u0E2B\u0E19\u0E35\u0E49', 'fin.hAp':'\u0E2B\u0E19\u0E35\u0E49\u0E04\u0E48\u0E32\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32\u0E17\u0E35\u0E48\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E08\u0E48\u0E32\u0E22', 'fin.hApNote':'\u0E08\u0E31\u0E14\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E2B\u0E19\u0E49\u0E32 AP', 'fin.hStock':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E2A\u0E15\u0E4A\u0E2D\u0E01\u0E04\u0E07\u0E40\u0E2B\u0E25\u0E37\u0E2D', 'fin.hStockNote':'\u0E40\u0E07\u0E34\u0E19\u0E17\u0E35\u0E48\u0E08\u0E21\u0E2D\u0E22\u0E39\u0E48\u0E01\u0E31\u0E1A\u0E02\u0E2D\u0E07', 'fin.hLoss':'\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E02\u0E32\u0E14\u0E17\u0E38\u0E19', 'fin.hLossNote':'\u0E14\u0E39\u0E23\u0E32\u0E22\u0E25\u0E30\u0E40\u0E2D\u0E35\u0E22\u0E14\u0E17\u0E35\u0E48\u0E2B\u0E19\u0E49\u0E32\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E02\u0E32\u0E22', 'fin.hVat':'VAT \u0E17\u0E35\u0E48\u0E40\u0E01\u0E47\u0E1A\u0E08\u0E32\u0E01\u0E25\u0E39\u0E01\u0E04\u0E49\u0E32', 'fin.hVatNote':'\u0E44\u0E21\u0E48\u0E43\u0E0A\u0E48\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49\u0E02\u0E2D\u0E07\u0E23\u0E49\u0E32\u0E19', 'fin.statement':'\u0E07\u0E1A\u0E01\u0E33\u0E44\u0E23\u0E02\u0E32\u0E14\u0E17\u0E38\u0E19', 'fin.ofRevenue':'% \u0E02\u0E2D\u0E07\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49', 'fin.revenue':'\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49\u0E08\u0E32\u0E01\u0E01\u0E32\u0E23\u0E02\u0E32\u0E22', 'fin.sellingExp':'\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22\u0E43\u0E19\u0E01\u0E32\u0E23\u0E02\u0E32\u0E22', 'fin.afterSelling':'\u0E01\u0E33\u0E44\u0E23\u0E2B\u0E25\u0E31\u0E07\u0E2B\u0E31\u0E01\u0E04\u0E48\u0E32\u0E01\u0E32\u0E23\u0E02\u0E32\u0E22', 'fin.noOpex':'\u0E44\u0E21\u0E48\u0E21\u0E35\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22\u0E14\u0E33\u0E40\u0E19\u0E34\u0E19\u0E07\u0E32\u0E19\u0E43\u0E19\u0E0A\u0E48\u0E27\u0E07\u0E19\u0E35\u0E49', 'fin.revTrend':'\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49\u0E22\u0E49\u0E2D\u0E19\u0E2B\u0E25\u0E31\u0E07 6 \u0E40\u0E14\u0E37\u0E2D\u0E19', 'fin.netTrend':'\u0E01\u0E33\u0E44\u0E23\u0E2A\u0E38\u0E17\u0E18\u0E34\u0E22\u0E49\u0E2D\u0E19\u0E2B\u0E25\u0E31\u0E07 6 \u0E40\u0E14\u0E37\u0E2D\u0E19', 'fin.trendHint':'\u0E16\u0E49\u0E32\u0E23\u0E32\u0E22\u0E44\u0E14\u0E49\u0E42\u0E15\u0E41\u0E15\u0E48\u0E01\u0E33\u0E44\u0E23\u0E44\u0E21\u0E48\u0E42\u0E15 \u0E41\u0E1B\u0E25\u0E27\u0E48\u0E32\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E01\u0E33\u0E25\u0E31\u0E07\u0E01\u0E34\u0E19\u0E01\u0E33\u0E44\u0E23', 'fin.byMonth':'\u0E2A\u0E23\u0E38\u0E1B\u0E23\u0E32\u0E22\u0E40\u0E14\u0E37\u0E2D\u0E19', 'fin.month':'\u0E40\u0E14\u0E37\u0E2D\u0E19', 'fin.movement':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23', 'fin.party':'\u0E04\u0E39\u0E48\u0E04\u0E49\u0E32', 'fin.in':'\u0E40\u0E07\u0E34\u0E19\u0E40\u0E02\u0E49\u0E32', 'fin.out':'\u0E40\u0E07\u0E34\u0E19\u0E2D\u0E2D\u0E01', 'fin.mCustomer':'\u0E23\u0E31\u0E1A\u0E08\u0E32\u0E01\u0E25\u0E39\u0E01\u0E04\u0E49\u0E32', 'fin.mSupplier':'\u0E08\u0E48\u0E32\u0E22\u0E04\u0E48\u0E32\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'fin.noMoves':'\u0E44\u0E21\u0E48\u0E21\u0E35\u0E01\u0E32\u0E23\u0E40\u0E04\u0E25\u0E37\u0E48\u0E2D\u0E19\u0E44\u0E2B\u0E27\u0E02\u0E2D\u0E07\u0E40\u0E07\u0E34\u0E19', 'fin.inTrend':'\u0E40\u0E07\u0E34\u0E19\u0E40\u0E02\u0E49\u0E32\u0E23\u0E32\u0E22\u0E40\u0E14\u0E37\u0E2D\u0E19', 'fin.outTrend':'\u0E40\u0E07\u0E34\u0E19\u0E2D\u0E2D\u0E01\u0E23\u0E32\u0E22\u0E40\u0E14\u0E37\u0E2D\u0E19', 'fin.cashHint':'\u0E40\u0E07\u0E34\u0E19\u0E2A\u0E14\u0E15\u0E48\u0E32\u0E07\u0E08\u0E32\u0E01\u0E01\u0E33\u0E44\u0E23 \u2014 \u0E02\u0E32\u0E22\u0E44\u0E14\u0E49\u0E41\u0E15\u0E48\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E40\u0E01\u0E47\u0E1A\u0E40\u0E07\u0E34\u0E19 \u0E01\u0E47\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E40\u0E02\u0E49\u0E32\u0E01\u0E23\u0E30\u0E40\u0E1B\u0E4B\u0E32', 'fin.vsProfit':'\u0E15\u0E48\u0E32\u0E07\u0E08\u0E32\u0E01\u0E01\u0E33\u0E44\u0E23', 'ox.payrollOf':'\u0E40\u0E07\u0E34\u0E19\u0E40\u0E14\u0E37\u0E2D\u0E19\u0E1E\u0E19\u0E31\u0E01\u0E07\u0E32\u0E19 \u2014 {m}', 'ox.autoRow':'\u0E23\u0E30\u0E1A\u0E1A\u0E25\u0E07\u0E43\u0E2B\u0E49\u0E08\u0E32\u0E01\u0E01\u0E32\u0E23\u0E2D\u0E19\u0E38\u0E21\u0E31\u0E15\u0E34\u0E40\u0E07\u0E34\u0E19\u0E40\u0E14\u0E37\u0E2D\u0E19 \u2014 \u0E41\u0E01\u0E49\u0E17\u0E35\u0E48\u0E19\u0E35\u0E48\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49', 'ox.category':'\u0E2B\u0E21\u0E27\u0E14', 'ox.details':'\u0E23\u0E32\u0E22\u0E25\u0E30\u0E40\u0E2D\u0E35\u0E22\u0E14', 'ox.amount':'\u0E08\u0E33\u0E19\u0E27\u0E19\u0E40\u0E07\u0E34\u0E19', 'ox.receipt':'\u0E43\u0E1A\u0E40\u0E2A\u0E23\u0E47\u0E08/\u0E2B\u0E25\u0E31\u0E01\u0E10\u0E32\u0E19', 'ox.add':'+ \u0E40\u0E1E\u0E34\u0E48\u0E21\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23', 'ox.addTitle':'\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E23\u0E32\u0E22\u0E08\u0E48\u0E32\u0E22\u0E43\u0E2B\u0E21\u0E48', 'ox.addHint':'\u0E01\u0E23\u0E2D\u0E01\u0E41\u0E25\u0E49\u0E27\u0E01\u0E14 Enter \u0E01\u0E47\u0E44\u0E14\u0E49 \u00B7 \u0E41\u0E01\u0E49\u0E43\u0E19\u0E15\u0E32\u0E23\u0E32\u0E07\u0E44\u0E14\u0E49\u0E40\u0E25\u0E22 \u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E17\u0E31\u0E19\u0E17\u0E35', 'ox.descPh':'\u0E08\u0E48\u0E32\u0E22\u0E04\u0E48\u0E32\u0E2D\u0E30\u0E44\u0E23', 'ox.count':'\u0E08\u0E33\u0E19\u0E27\u0E19\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23', 'ox.total':'\u0E23\u0E27\u0E21\u0E23\u0E32\u0E22\u0E08\u0E48\u0E32\u0E22', 'ox.avg':'\u0E40\u0E09\u0E25\u0E35\u0E48\u0E22\u0E15\u0E48\u0E2D\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23', 'ox.biggest':'\u0E2B\u0E21\u0E27\u0E14\u0E17\u0E35\u0E48\u0E08\u0E48\u0E32\u0E22\u0E21\u0E32\u0E01\u0E2A\u0E38\u0E14', 'ox.byCat':'\u0E23\u0E32\u0E22\u0E08\u0E48\u0E32\u0E22\u0E15\u0E32\u0E21\u0E2B\u0E21\u0E27\u0E14', 'ox.short':'\u0E23\u0E32\u0E22\u0E08\u0E48\u0E32\u0E22', 'ox.empty':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E21\u0E35\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23', 'ox.errAmount':'\u0E01\u0E23\u0E38\u0E13\u0E32\u0E43\u0E2A\u0E48\u0E08\u0E33\u0E19\u0E27\u0E19\u0E40\u0E07\u0E34\u0E19', 'ox.delConfirm':'\u0E25\u0E1A\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E19\u0E35\u0E49?', 'ap.status':'\u0E2A\u0E16\u0E32\u0E19\u0E30\u0E2B\u0E19\u0E35\u0E49', 'ap.unpaid':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E08\u0E48\u0E32\u0E22', 'ap.partial':'\u0E08\u0E48\u0E32\u0E22\u0E1A\u0E32\u0E07\u0E2A\u0E48\u0E27\u0E19', 'ap.paid':'\u0E08\u0E48\u0E32\u0E22\u0E04\u0E23\u0E1A', 'ap.proof':'\u0E2B\u0E25\u0E31\u0E01\u0E10\u0E32\u0E19\u0E01\u0E32\u0E23\u0E0A\u0E33\u0E23\u0E30\u0E2B\u0E19\u0E35\u0E49', 'ap.amount':'\u0E22\u0E2D\u0E14\u0E23\u0E27\u0E21', 'ap.entries':'\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E23\u0E31\u0E1A\u0E40\u0E02\u0E49\u0E32', 'ap.total':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E23\u0E27\u0E21', 'ap.owed':'\u0E22\u0E2D\u0E14\u0E04\u0E49\u0E32\u0E07\u0E08\u0E48\u0E32\u0E22', 'ap.settled':'\u0E08\u0E48\u0E32\u0E22\u0E41\u0E25\u0E49\u0E27', 'ap.empty':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E21\u0E35\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E40\u0E15\u0E34\u0E21\u0E2A\u0E15\u0E4A\u0E2D\u0E01', 'ap.clickHint':'\u0E04\u0E25\u0E34\u0E01\u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E40\u0E1B\u0E25\u0E35\u0E48\u0E22\u0E19\u0E2A\u0E16\u0E32\u0E19\u0E30', 'ap.unsaved':'\u0E21\u0E35\u0E01\u0E32\u0E23\u0E41\u0E01\u0E49\u0E44\u0E02\u0E17\u0E35\u0E48\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01', 'ap.confirmTitle':'\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E01\u0E32\u0E23\u0E40\u0E1B\u0E25\u0E35\u0E48\u0E22\u0E19\u0E41\u0E1B\u0E25\u0E07', 'ap.confirmBody':'\u0E22\u0E37\u0E19\u0E22\u0E31\u0E19\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01 {n} \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23?', 'confirm':'\u0E22\u0E37\u0E19\u0E22\u0E31\u0E19', 'nav.apList':'\u0E40\u0E08\u0E49\u0E32\u0E2B\u0E19\u0E35\u0E49 (AP)', 'nav.opExpense':'\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22\u0E14\u0E33\u0E40\u0E19\u0E34\u0E19\u0E07\u0E32\u0E19', 'nav.cogsTracking':'\u0E15\u0E34\u0E14\u0E15\u0E32\u0E21\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E02\u0E32\u0E22', 'sv.skus':'\u0E08\u0E33\u0E19\u0E27\u0E19\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'sv.units':'\u0E08\u0E33\u0E19\u0E27\u0E19\u0E0A\u0E34\u0E49\u0E19\u0E04\u0E07\u0E40\u0E2B\u0E25\u0E37\u0E2D', 'sv.atCost':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E15\u0E32\u0E21\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19', 'sv.atRetail':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E15\u0E32\u0E21\u0E23\u0E32\u0E04\u0E32\u0E02\u0E32\u0E22', 'sv.potential':'\u0E01\u0E33\u0E44\u0E23\u0E17\u0E35\u0E48\u0E04\u0E32\u0E14\u0E27\u0E48\u0E32\u0E08\u0E30\u0E44\u0E14\u0E49', 'sv.margin':'\u0E2D\u0E31\u0E15\u0E23\u0E32\u0E01\u0E33\u0E44\u0E23', 'sv.byCat':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E15\u0E32\u0E21\u0E2B\u0E21\u0E27\u0E14\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'sv.byOrigin':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E15\u0E32\u0E21\u0E41\u0E2B\u0E25\u0E48\u0E07\u0E17\u0E35\u0E48\u0E21\u0E32', 'sv.top':'\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32\u0E17\u0E35\u0E48\u0E08\u0E21\u0E17\u0E38\u0E19\u0E21\u0E32\u0E01\u0E17\u0E35\u0E48\u0E2A\u0E38\u0E14', 'sv.topHint':'\u0E40\u0E07\u0E34\u0E19\u0E01\u0E49\u0E2D\u0E19\u0E2D\u0E22\u0E39\u0E48\u0E17\u0E35\u0E48\u0E02\u0E2D\u0E07\u0E40\u0E2B\u0E25\u0E48\u0E32\u0E19\u0E35\u0E49\u0E21\u0E32\u0E01\u0E17\u0E35\u0E48\u0E2A\u0E38\u0E14 (5 \u0E2D\u0E31\u0E19\u0E14\u0E31\u0E1A\u0E41\u0E23\u0E01)', 'sv.onHand':'\u0E04\u0E07\u0E40\u0E2B\u0E25\u0E37\u0E2D', 'sv.avgCost':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19/\u0E0A\u0E34\u0E49\u0E19', 'sv.empty':'\u0E44\u0E21\u0E48\u0E21\u0E35\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32\u0E04\u0E07\u0E40\u0E2B\u0E25\u0E37\u0E2D', 'nav.stockValue':'\u0E21\u0E39\u0E25\u0E04\u0E48\u0E32\u0E2A\u0E15\u0E4A\u0E2D\u0E01', 'cogs.pfee':'\u0E04\u0E48\u0E32\u0E18\u0E23\u0E23\u0E21\u0E40\u0E19\u0E35\u0E22\u0E21\u0E41\u0E1E\u0E25\u0E15\u0E1F\u0E2D\u0E23\u0E4C\u0E21', 'cogs.dfee':'\u0E04\u0E48\u0E32\u0E08\u0E31\u0E14\u0E2A\u0E48\u0E07\u0E08\u0E23\u0E34\u0E07', 'cogs.commission':'\u0E04\u0E48\u0E32\u0E04\u0E2D\u0E21', 'cogs.netProfit':'\u0E01\u0E33\u0E44\u0E23\u0E2B\u0E25\u0E31\u0E07\u0E2B\u0E31\u0E01\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22', 'comm.payout':'\u0E23\u0E39\u0E1B\u0E41\u0E1A\u0E1A\u0E01\u0E32\u0E23\u0E08\u0E48\u0E32\u0E22', 'comm.pool':'\u0E23\u0E27\u0E21\u0E41\u0E25\u0E49\u0E27\u0E2B\u0E32\u0E23\u0E40\u0E17\u0E48\u0E32\u0E01\u0E31\u0E19', 'comm.person':'\u0E41\u0E22\u0E01\u0E23\u0E32\u0E22\u0E1A\u0E38\u0E04\u0E04\u0E25', 'comm.payoutHint':'\u0E1C\u0E39\u0E01\u0E01\u0E31\u0E1A\u0E1E\u0E19\u0E31\u0E01\u0E07\u0E32\u0E19\u0E1B\u0E23\u0E30\u0E40\u0E20\u0E17 Salesperson', 'comm.sellerCount':'\u0E1E\u0E19\u0E31\u0E01\u0E07\u0E32\u0E19\u0E02\u0E32\u0E22\u0E02\u0E13\u0E30\u0E19\u0E35\u0E49', 'comm.base':'\u0E10\u0E32\u0E19\u0E01\u0E32\u0E23\u0E04\u0E33\u0E19\u0E27\u0E13', 'comm.baseGoods':'\u0E40\u0E09\u0E1E\u0E32\u0E30\u0E23\u0E32\u0E04\u0E32\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'comm.baseGoodsShip':'\u0E23\u0E27\u0E21\u0E04\u0E48\u0E32\u0E2A\u0E48\u0E07', 'comm.rates':'\u0E2D\u0E31\u0E15\u0E23\u0E32\u0E15\u0E32\u0E21\u0E2B\u0E21\u0E27\u0E14\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'comm.profitBase':'\u0E04\u0E33\u0E19\u0E27\u0E13\u0E08\u0E32\u0E01 \u0E01\u0E33\u0E44\u0E23 (\u0E22\u0E2D\u0E14\u0E02\u0E32\u0E22 \u2212 \u0E15\u0E49\u0E19\u0E17\u0E38\u0E19 \u2212 \u0E2A\u0E48\u0E27\u0E19\u0E25\u0E14 \u2212 \u0E04\u0E48\u0E32\u0E18\u0E23\u0E23\u0E21\u0E40\u0E19\u0E35\u0E22\u0E21) \u0E44\u0E21\u0E48\u0E43\u0E0A\u0E48\u0E22\u0E2D\u0E14\u0E02\u0E32\u0E22 \u00B7 \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E02\u0E32\u0E14\u0E17\u0E38\u0E19\u0E44\u0E21\u0E48\u0E04\u0E34\u0E14\u0E04\u0E48\u0E32\u0E04\u0E2D\u0E21', 'comm.ratesHint':'\u0E04\u0E48\u0E32\u0E40\u0E23\u0E34\u0E48\u0E21\u0E15\u0E49\u0E19 5% \u0E17\u0E38\u0E01\u0E2B\u0E21\u0E27\u0E14', 'comm.noCats':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E21\u0E35\u0E2B\u0E21\u0E27\u0E14\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'cogs.top':'\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32\u0E17\u0E33\u0E01\u0E33\u0E44\u0E23\u0E2A\u0E39\u0E07\u0E2A\u0E38\u0E14 10 \u0E2D\u0E31\u0E19\u0E14\u0E31\u0E1A', 'cogs.topHint':'\u0E01\u0E33\u0E44\u0E23\u0E02\u0E31\u0E49\u0E19\u0E15\u0E49\u0E19\u0E15\u0E48\u0E2D\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32 (\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E2B\u0E31\u0E01\u0E04\u0E48\u0E32\u0E18\u0E23\u0E23\u0E21\u0E40\u0E19\u0E35\u0E22\u0E21/\u0E04\u0E48\u0E32\u0E2A\u0E48\u0E07/\u0E04\u0E48\u0E32\u0E04\u0E2D\u0E21 \u0E40\u0E1E\u0E23\u0E32\u0E30\u0E40\u0E1B\u0E47\u0E19\u0E04\u0E48\u0E32\u0E43\u0E0A\u0E49\u0E08\u0E48\u0E32\u0E22\u0E23\u0E30\u0E14\u0E31\u0E1A\u0E1A\u0E34\u0E25)', 'cogs.sold':'\u0E02\u0E32\u0E22\u0E44\u0E14\u0E49 (\u0E0A\u0E34\u0E49\u0E19)', 'cogs.perBill':'\u0E23\u0E32\u0E22\u0E25\u0E30\u0E40\u0E2D\u0E35\u0E22\u0E14\u0E23\u0E32\u0E22\u0E1A\u0E34\u0E25', 'cogs.bills':'\u0E08\u0E33\u0E19\u0E27\u0E19\u0E1A\u0E34\u0E25', 'cogs.revenue':'\u0E22\u0E2D\u0E14\u0E02\u0E32\u0E22 (\u0E01\u0E48\u0E2D\u0E19 VAT)', 'cogs.total':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E02\u0E32\u0E22\u0E23\u0E27\u0E21', 'cogs.profit':'\u0E01\u0E33\u0E44\u0E23\u0E02\u0E31\u0E49\u0E19\u0E15\u0E49\u0E19', 'cogs.margin':'\u0E2D\u0E31\u0E15\u0E23\u0E32\u0E01\u0E33\u0E44\u0E23', 'cogs.byCat':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E15\u0E32\u0E21\u0E2B\u0E21\u0E27\u0E14\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32', 'cogs.byOrigin':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E15\u0E32\u0E21\u0E41\u0E2B\u0E25\u0E48\u0E07\u0E17\u0E35\u0E48\u0E21\u0E32', 'cogs.byStatus':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19 \u0E0A\u0E33\u0E23\u0E30\u0E41\u0E25\u0E49\u0E27 vs \u0E04\u0E49\u0E32\u0E07\u0E0A\u0E33\u0E23\u0E30', 'cogs.paid':'\u0E0A\u0E33\u0E23\u0E30\u0E41\u0E25\u0E49\u0E27', 'cogs.unpaid':'\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E0A\u0E33\u0E23\u0E30', 'cogs.short':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19', 'cogs.barHint':'\u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E17\u0E35\u0E48\u0E08\u0E21\u0E43\u0E19\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E22\u0E31\u0E07\u0E40\u0E01\u0E47\u0E1A\u0E40\u0E07\u0E34\u0E19\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49 = \u0E40\u0E07\u0E34\u0E19\u0E17\u0E35\u0E48\u0E08\u0E48\u0E32\u0E22\u0E44\u0E1B\u0E41\u0E25\u0E49\u0E27\u0E41\u0E15\u0E48\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32', 'cogs.missing':'\u0E21\u0E35 {n} \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E23\u0E30\u0E1A\u0E38 lot \u0E15\u0E49\u0E19\u0E17\u0E38\u0E19 \u2014 \u0E15\u0E49\u0E19\u0E17\u0E38\u0E19\u0E17\u0E35\u0E48\u0E41\u0E2A\u0E14\u0E07\u0E2D\u0E32\u0E08\u0E15\u0E48\u0E33\u0E01\u0E27\u0E48\u0E32\u0E08\u0E23\u0E34\u0E07', 'inv.byStatus':'\u0E41\u0E22\u0E01\u0E15\u0E32\u0E21\u0E2A\u0E16\u0E32\u0E19\u0E30\u0E1A\u0E34\u0E25', 'inv.bills':'\u0E1A\u0E34\u0E25', 'inv.billed':'\u0E22\u0E2D\u0E14\u0E23\u0E27\u0E21\u0E17\u0E35\u0E48\u0E2D\u0E2D\u0E01\u0E1A\u0E34\u0E25', 'inv.received':'\u0E23\u0E31\u0E1A\u0E21\u0E32\u0E41\u0E25\u0E49\u0E27 (\u0E21\u0E31\u0E14\u0E08\u0E33)', 'inv.unpaid':'\u0E1A\u0E34\u0E25\u0E17\u0E35\u0E48\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E23\u0E31\u0E1A\u0E0A\u0E33\u0E23\u0E30', 'inv.empty':'\u0E44\u0E21\u0E48\u0E21\u0E35\u0E1A\u0E34\u0E25\u0E04\u0E49\u0E32\u0E07\u0E0A\u0E33\u0E23\u0E30', 'nav.orderHistory':'ประวัติแก้ไข', 'eh.record':'รายการ', 'eh.changes':'จำนวนครั้ง', 'eh.lastAction':'ล่าสุด', 'eh.lastEdited':'แก้ล่าสุด', 'eh.when':'วันเวลา', 'eh.by':'ผู้ทำ', 'eh.action':'การกระทำ', 'eh.viewRaw':'ดูข้อมูลดิบ', 'eh.back':'กลับ', 'eh.empty':'ยังไม่มีประวัติ', 'eh.rawTitle':'ข้อมูล ณ ตอนนั้น (raw)', 'eh.create':'สร้าง', 'eh.edit':'แก้ไข', 'eh.delete':'ลบ', 'eh.imgChanges':'\u0E01\u0E32\u0E23\u0E40\u0E1B\u0E25\u0E35\u0E48\u0E22\u0E19\u0E41\u0E1B\u0E25\u0E07\u0E23\u0E39\u0E1B', 'eh.imgAdded':'\u0E40\u0E1E\u0E34\u0E48\u0E21\u0E23\u0E39\u0E1B', 'eh.imgRemoved':'\u0E25\u0E1A\u0E23\u0E39\u0E1B', 'eh.imgNoName':'(\u0E44\u0E21\u0E48\u0E17\u0E23\u0E32\u0E1A\u0E0A\u0E37\u0E48\u0E2D\u0E44\u0E1F\u0E25\u0E4C)', 'eh.old':'เดิม', 'eh.new':'ใหม่', 'eh.viewDetail':'ดูรายละเอียด', 'eh.items':'รายการสินค้า', 'eh.note':'หมายเหตุ', 'del.empty':'ยังไม่มีรายการจัดส่ง', 'set.deliveryStatuses':'สถานะการจัดส่ง', 'set.shippingTypes':'ประเภทการจัดส่ง (Shipping Type)', 'set.outsources':'ผู้ให้บริการ Outsource', 'set.regionMode':'รูปแบบการแบ่งภูมิภาค', 'nav.grouping':'การจัดกลุ่ม', 'nav.shippingCost':'ค่าจัดส่ง', 'nav.deliveryList':'รายการจัดส่ง', 'nav.deliveryBoard':'สถานะการจัดส่ง', 'nav.deliveryCalendar':'ปฏิทิน', 'nav.profile':'องค์กร', 'nav.profileGeneral':'ร้านค้าทั่วไป', 'bp.titleGeneral':'ข้อมูลร้านค้าทั่วไป (สำหรับออกเอกสาร)', 'bp.descGeneral':'ใช้เป็นหัวเอกสารของบิลที่ไม่ติ๊ก VAT — ไม่มีเลขประจำตัวผู้เสียภาษี', 'bp.descOrg':'ใช้เป็นหัวเอกสารของบิลที่ติ๊ก VAT (ใบกำกับภาษี)', 'cal.driverType':'ประเภทคนขับ', 'cal.driver':'คนขับ', 'cal.allTypes':'ทุกประเภท', 'cal.allDrivers':'ทุกคน', 'cal.today':'วันนี้', 'cal.unscheduled':'ยังไม่กำหนดวัน {n} รายการ', 'cal.pickTitle':'เลือกรายการที่จะส่งวันนี้', 'cal.pickNone':'ยังไม่มีรายการจัดส่งให้เลือก', 'cal.pickAllAssigned':'ทุกรายการถูกกำหนดวันไปหมดแล้ว', 'cal.colorBy':'สีตาม', 'cal.byStatus':'สถานะ', 'cal.byType':'ประเภทคนขับ', 'cal.byDriver':'ชื่อคนขับ', 'nav.deliveryDrivers':'คนขับ', 'drv.title':'สีของคนขับ', 'drv.desc':'ตั้งสีให้คนขับแต่ละคน — ใช้แสดงในปฏิทินเมื่อเลือกสีตามคนขับ', 'drv.our':'คนขับของร้าน', 'drv.outsource':'Outsource', 'drv.empty':'ยังไม่มีคนขับ (เพิ่มพนักงานประเภท Delivery Driver หรือ Outsource ก่อน)', 'set.shipCost':'ค่าจัดส่ง', 'set.shipCategory':'ประเภทสินค้า (Category)', 'set.shipCostDesc':'ตั้งราคาค่าจัดส่ง — ตามภาค (4/6) หรือรายจังหวัด', 'set.shipMode':'รูปแบบการคิดราคา', 'set.shipByProvince':'รายจังหวัด', 'set.shipProvSwitch':'วิธีตั้งราคารายจังหวัด', 'set.shipException':'ตามภาค + ยกเว้นบางจังหวัด', 'set.shipManual':'ตั้งเองทุกจังหวัด', 'set.shipPickRegion':'เลือกภาค (เพื่อตั้งราคาจังหวัดในภาคนั้น)', 'set.shipRegionBase':'ราคาฐานของภาค', 'set.baht':'บาท', 'set.region4':'4 ภาค', 'set.region6':'6 ภาค', 'set.regionModeHint':'เลือกวิธีแบ่งภูมิภาค — มีผลกับคอลัมน์/ตัวกรอง "ภาค" ในหน้าจัดส่ง และสีแบ่งภาคบนแผนที่ (ไม่ต้องเก็บข้อมูลซ้ำ เพราะภาคคำนวณจากรหัสจังหวัด)',
       'rev.orderStatus': 'สถานะออเดอร์', 'rev.invoiceStatus': 'สถานะใบเสร็จ', 'rev.totalRows': 'รวม',
       'rev.empty': 'ยังไม่มีออเดอร์ เริ่มเพิ่มออเดอร์แรกได้เลย', 'rev.delConfirm': 'ลบออเดอร์นี้?',
-      'rev.addItem': '+ เพิ่มสินค้า', 'rev.itemName': 'ชื่อสินค้า', 'rev.itemProduct': 'สินค้า', 'rev.itemQty': 'จำนวน', 'rev.itemDisc': 'ส่วนลด', 'rev.itemNet': 'สุทธิ', 'rev.itemPrice': 'ราคา', 'rev.itemsTotal': 'รวมสินค้า',
+      'pp.title':'เลือกสินค้า', 'pp.searchPh':'ค้นหาชื่อสินค้า หรือรหัสสินค้า…', 'pp.repair':'ค่าซ่อม', 'pp.repairHint':'ใช้สำหรับค่าซ่อม/ค่าบริการที่ไม่ใช่สินค้าในสต๊อก — กรอกรายละเอียดและราคาเอง (ไม่ตัดสต๊อก ไม่มีต้นทุน)', 'pp.repairDesc':'รายละเอียดงานซ่อม', 'pp.repairDescPh':'เช่น เปลี่ยนสายเบรกหน้า + ค่าแรง', 'pp.repairPrice':'ราคา (บาท)', 'pp.repairAdd':'เพิ่มค่าซ่อม', 'pp.errRepairDesc':'กรุณากรอกรายละเอียดค่าซ่อม', 'pp.noMatch':'ไม่พบสินค้าที่ตรงกับการค้นหา', 'pp.count':'{n} รายการ', 'pp.change':'คลิกเพื่อเปลี่ยน', 'rev.addItem': '+ เพิ่มรายการ', 'rev.itemName': 'ชื่อสินค้า', 'rev.itemProduct': 'สินค้า', 'rev.itemQty': 'จำนวน', 'rev.itemDisc': 'ส่วนลด', 'rev.itemNet': 'สุทธิ', 'rev.itemPrice': 'ราคา', 'rev.itemsTotal': 'รวมสินค้า',
       'rev.errCustomer': 'กรุณากรอกชื่อผู้รับ', 'rev.errAddress': 'กรุณากรอกที่อยู่ผู้รับ', 'rev.errItems': 'กรุณาเพิ่มรายการสินค้าอย่างน้อย 1 รายการ', 'rev.errPickProduct': 'กรุณาเลือกสินค้าจากรายการที่มีเท่านั้น', 'rev.pickProduct': '— เลือกสินค้า —', 'rev.noProducts': 'ยังไม่มีสินค้าในระบบ กรุณาเพิ่มสินค้าในหน้าจัดการสินค้าก่อนนะคะ',
       'prod.pinTitle': 'หน้านี้ต้องใส่ PIN', 'prod.pinDesc': 'กรอกรหัส PIN 6 หลักเพื่อจัดการสินค้า', 'prod.pinWrong': 'PIN ไม่ถูกต้องค่ะ ลองใหม่อีกครั้ง', 'prod.pinClear': 'ล้าง',
       'prod.restock': '+ เติมสต๊อก', 'prod.add': '+ เพิ่มสินค้า',
@@ -5584,7 +5822,7 @@
       'promo.noProdInCat': 'ไม่มีสินค้าในหมวดนี้', 'promo.delConfirm': 'ลบโปรโมชันนี้ใช่ไหมคะ?',
       'promo.errDates': 'กรุณาใส่วันเริ่มและวันสิ้นสุด', 'promo.errRange': 'วันสิ้นสุดต้องไม่ก่อนวันเริ่ม', 'promo.errItems': 'กรุณาเลือกสินค้าอย่างน้อย 1 ชิ้น',
       'promo.endedTitle': 'โปรโมชันสิ้นสุดแล้ว', 'promo.endedOn': 'สิ้นสุด',
-      'prod.stock': 'สต๊อก', 'prod.origin':'แหล่งต้นทุน (สต๊อกเปิด)', 'prod.noLots':'ยังไม่มี lot', 'prod.unit':'ชิ้น', 'prod.reserved': 'จองแล้ว', 'prod.sold': 'ขายแล้ว', 'prod.ptype': 'หมวดหมู่', 'prod.pickType': '— เลือกหมวดหมู่ —', 'prod.errType': 'กรุณาเลือกหมวดหมู่', 'prod.tag': 'สถานะ', 'prod.empty': 'ยังไม่มีสินค้าในระบบ เริ่มเพิ่มสินค้าแรกได้เลย',
+      'prod.stock': 'สต๊อก', 'prod.allCats':'สินค้าทั้งหมด', 'prod.noCat':'ไม่มีหมวดหมู่', 'prod.showing':'แสดง {a}–{b} จาก {n} รายการ', 'prod.origin':'แหล่งต้นทุน (สต๊อกเปิด)', 'prod.noLots':'ยังไม่มี lot', 'prod.unit':'ชิ้น', 'prod.reserved': 'จองแล้ว', 'prod.sold': 'ขายแล้ว', 'prod.ptype': 'หมวดหมู่', 'prod.pickType': '— เลือกหมวดหมู่ —', 'prod.errType': 'กรุณาเลือกหมวดหมู่', 'prod.tag': 'สถานะ', 'prod.empty': 'ยังไม่มีสินค้าในระบบ เริ่มเพิ่มสินค้าแรกได้เลย',
       'prod.delConfirm': 'ลบสินค้านี้? (ออเดอร์เก่าจะยังเก็บชื่อ/ราคาไว้ตามเดิม)', 'prod.errSku': 'กรุณากรอกรหัสสินค้า', 'prod.errName': 'กรุณากรอกชื่อสินค้า', 'exp.errDetails': 'กรุณากรอกรายละเอียดรายการ', 'exp.errDate': 'กรุณาเลือกวันที่', 'exp.errAmount': 'จำนวนต้องมากกว่า 0',
       'nav.expense': 'รายจ่าย', 'nav.summary': 'สรุปต้นทุน', 'nav.revenue': 'รายรับ/ออกบิล',
       'nav.orderStatus': 'สถานะออเดอร์', 'nav.invoiceStatus': 'สถานะใบเสร็จ',
@@ -5631,10 +5869,10 @@
       'sum.period': 'Period', 'sum.allTime': 'All time', 'sum.tag': 'Tag', 'sum.netTotal': 'Net Total', 'sum.percent': '% of total',
       'sum.sum': 'Sum', 'sum.totalNet': 'Total expenses (net)', 'sum.count': 'Entries', 'sum.avg': 'Average per entry', 'sum.byCategory':'Cost by product category', 'sum.byOrigin':'Cost by cost origin', 'sum.uncategorised':'Uncategorised', 'sum.noOrigin':'No origin', 'sum.noData': 'No data in this period yet',
       'rev.add': '+ Add order', 'rev.addTitle': 'Add order', 'rev.editTitle': 'Edit order',
-      'rev.invoiceNo': 'Invoice #', 'col.lastEdited':'Last edited', 'rev.customer': 'Recipient', 'rev.customerHint': 'Recipient full name', 'rev.back':'Back', 'rev.mapHint':'Or pick a province on the map', 'rev.selProvince':'Selected province', 'rev.noProvince':'No province selected', 'region.north':'North', 'region.central':'Central', 'region.northeast':'Northeast', 'region.east':'East', 'region.west':'West', 'region.south':'South', 'rev.address': 'Recipient address', 'rev.addressHint': 'Shipping address', 'rev.addrLine':'Address (no./soi/road)', 'rev.addrLineHint':'House no., moo, soi, road', 'rev.province':'Province', 'rev.district':'District', 'rev.subdistrict':'Subdistrict', 'rev.postal':'Postal code', 'rev.postalHint':'Auto', 'rev.loading':'Loading...', 'rev.errAddrLine':'Please enter the address line', 'rev.errAddrGeo':'Please select province/district/subdistrict', 'sec.seller':'Seller', 'sell.issuedBy':'Issued by', 'sell.signature':'Signature', 'sell.clear':'Clear', 'sell.upload':'Upload image', 'sell.signHint':'Draw in the box, or upload an image (max 256KB)', 'sell.errSign':'Please sign before saving', 'sell.seller':'Seller', 'rev.platformFee':'Platform fee', 'rev.platform': 'Sold via Platform', 'rev.platformHint': 'e.g. TikTok Shop', 'sec.delivery':'Delivery', 'sec.inventory':'Inventory', 'rev.phone':'Phone', 'rev.phoneHint':'Contact phone', 'rev.shippingTitle':'Shipping', 'rev.shippingCost':'Shipping', 'rev.shippingOverride':'Override shipping (manual)', 'rev.shipAuto':'Auto', 'rev.shipNoCat':'No products/categories yet', 'sec.vat':'VAT Management', 'sec.payment':'Payment', 'pay.mode':'Payment Method', 'pay.paid':'Partially Paid', 'pay.vatable':'This bill is charged VAT 7% (added on top of the net)', 'pay.vat':'VAT', 'pay.vatSeparated':'Separated', 'pay.vatYes':'VAT 7%', 'pay.noProof':'No payment proof attached to this bill', 'pay.proof':'Payment proof', 'pay.proofHint':'Up to 5 files (max 256KB each)', 'pay.download':'Download', 'pay.pending':'Amount Pending', 'set.colTh':'Thai name (TH)', 'set.colEn':'English name (EN)', 'set.colFee':'Fee %', 'set.colColor':'Colour', 'set.expenseCategories':'Expense Categories', 'set.platforms':'Sales Platforms', 'set.feeHint':'Platform fee (%)', 'set.paymentModes':'Payment Methods', 'rev.discountsTitle':'Discounts', 'rev.itemDiscount':'Item Discount', 'rev.shippingDiscount':'Shipping Discount', 'rev.overallDiscount':'Overall Discount', 'rev.totalDiscount':'Total Discount', 'rev.deliveryMethod':'Delivery Method', 'rev.responsible':'Responsible', 'rev.pickResp':'— select —', 'rev.respHint':'Enter responsible', 'rev.proofLabel':'Delivery proof (Outsource)', 'rev.proofPick':'Attach file', 'rev.proofAttached':'Attached', 'rev.proofNone':'No file', 'rev.items': 'Items', 'del.allProvinces':'All provinces', 'del.allRegions':'All regions', 'del.allStatuses':'All statuses', 'del.orderNo':'Order #', 'del.recipient':'Recipient', 'del.province':'Province', 'del.region':'Region', 'del.address':'Address', 'del.status':'Delivery status', 'del.shipType':'Shipping Type', 'del.responsible':'Responsible', 'del.proof':'Proof', 'del.verified':'Verified', 'del.deliveryDate':'Delivery Date', 'nav.productHistory':'Edit History', 'nav.invoicing':'Invoicing', 'nav.arStatus':'AR Status', 'nav.receipts':'Receipts', 'rc.avg':'Average per receipt', 'inv.deposit':'Deposits received', 'rc.count':'Receipts', 'rc.total':'Total', 'rc.byMode':'By payment mode', 'rc.receipts':'receipts', 'rc.empty':'Nothing paid yet', 'se.delivery':'Actual delivery fee', 'se.other':'Other expenses', 'se.status':'Status', 'se.added':'Added', 'se.none':'No expense', 'se.addNote':'Add a note', 'nav.sellingExpenses':'Selling Expenses', 'ap.mass':'Mass settle', 'ap.massBody':'All {n} entries currently in view will be set to Paid + verified, and the attached files copied onto each of them · you still need to press Save', 'ap.paidAmount':'Paid amount', 'ap.mass':'Mark all as paid', 'ap.massBody':'All {n} row(s) currently shown ({amt} ฿) will be set to Paid and Verified', 'ap.massProofHint':'Any file added here is copied to every row (optional)', 'ox.updatedBy':'Updated by', 'nav.opexHistory':'Edit History', 'nav.finOverview':'Overview', 'nav.pnl':'Profit & Loss', 'nav.cashFlow':'Cash Flow', 'nav.taxReport':'Sales Tax', 'tax.modeVat':'VAT bills', 'tax.modeNoVat':'Non-VAT bills', 'tax.invoices':'Tax invoices', 'tax.billsNoVat':'Bills without VAT', 'tax.base':'Value before VAT', 'tax.output':'Output VAT (7%)', 'tax.grand':'Total incl. VAT', 'tax.byMonth':'Monthly summary (for filing)', 'tax.detail':'Tax invoice detail', 'tax.detailNoVat':'Bills excluded from the report', 'tax.issuer':'Issuer', 'tax.empty':'Nothing in this period', 'tax.hint':'Only bills ticked as VAT are pulled in · on a split bill the shipping sits outside the tax base · output VAT only, input VAT is not deducted', 'tax.hintNoVat':'These bills are NOT counted in the sales tax report — listed here so a missed VAT tick is easy to spot', 'cd.noteTitle':'Remark on documents', 'cd.noteHint':'This is the DEFAULT remark filled into the Remark box of every new bill — each bill can then be edited on its own, and documents print whatever that bill says', 'cd.notePh':'e.g. warranty terms, care instructions, contact channels', 'cd.saved':'Saved', 'cd.previewTitle':'How it will look', 'cd.previewHint':'It appears just above the signature area', 'cd.previewEmpty':'No remark yet', 'rev.remarkHint':'Prints on the document · starts from the Customer Document default, editable per bill', 'rev.noteHint':'Internal note — never printed', 'noAccess':'This role has no access to any tab on this page', 'cd.remark':'Remark', 'fin.allTime':'All time', 'fin.custom':'Custom range', 'fin.thisMonth':'This month', 'fin.netProfit':'Net profit', 'fin.cashIn':'Cash in', 'fin.cashOut':'Cash out', 'fin.cashNet':'Net cash', 'fin.ar':'Receivables', 'fin.ap':'Payables', 'fin.revByPlatform':'Revenue by channel', 'fin.revShort':'revenue', 'fin.costMix':'Where the money goes', 'fin.health':'Financial health', 'fin.healthHint':'Figures that always deserve a look — these ignore the period filter', 'fin.item':'Item', 'fin.count':'Count', 'fin.note':'Note', 'fin.hAr':'Bills not yet collected', 'fin.hArNote':'Chase these on the Invoicing page', 'fin.hAp':'Stock bills not yet paid', 'fin.hApNote':'Managed on the AP page', 'fin.hStock':'Stock value on hand', 'fin.hStockNote':'Cash tied up in goods', 'fin.hLoss':'Bills sold at a loss', 'fin.hLossNote':'Check them in COGS Tracking', 'fin.hVat':'VAT collected from customers', 'fin.hVatNote':'Not your revenue', 'fin.statement':'Profit & loss statement', 'fin.ofRevenue':'% of revenue', 'fin.revenue':'Sales revenue', 'fin.sellingExp':'Selling expenses', 'fin.afterSelling':'Profit after selling costs', 'fin.noOpex':'No operating expenses in this period', 'fin.revTrend':'Revenue, last 6 months', 'fin.netTrend':'Net profit, last 6 months', 'fin.trendHint':'Revenue growing while profit does not usually means costs are eating the margin', 'fin.byMonth':'Month by month', 'fin.month':'Month', 'fin.movement':'Movement', 'fin.party':'Party', 'fin.in':'In', 'fin.out':'Out', 'fin.mCustomer':'From customer', 'fin.mSupplier':'To supplier', 'fin.noMoves':'No money moved in this period', 'fin.inTrend':'Cash in by month', 'fin.outTrend':'Cash out by month', 'fin.cashHint':'Cash differs from profit — a sale you have not been paid for brings in nothing', 'fin.vsProfit':'Cash vs profit', 'ox.payrollOf':'Payroll \u2014 {m}', 'ox.autoRow':'Posted automatically when the payroll month was authorized — not editable here', 'ox.category':'Category', 'ox.details':'Details', 'ox.amount':'Amount', 'ox.receipt':'Receipt', 'ox.add':'+ Add entry', 'ox.addTitle':'Record a new expense', 'ox.addHint':'Fill in and press Enter · rows can be edited in the table and save instantly', 'ox.descPh':'What was it for?', 'ox.count':'Entries', 'ox.total':'Total spent', 'ox.avg':'Average per entry', 'ox.biggest':'Biggest category', 'ox.byCat':'Spending by category', 'ox.short':'spent', 'ox.empty':'Nothing recorded yet', 'ox.errAmount':'Please enter an amount', 'ox.delConfirm':'Delete this entry?', 'ap.status':'AP Status', 'ap.unpaid':'Unpaid', 'ap.partial':'Partially Paid', 'ap.paid':'Paid', 'ap.proof':'Payment proof', 'ap.amount':'Amount', 'ap.entries':'Stock-in entries', 'ap.total':'Total value', 'ap.owed':'Still owed', 'ap.settled':'Settled', 'ap.empty':'No stock-in yet', 'ap.clickHint':'Click to change', 'ap.unsaved':'Unsaved changes', 'ap.confirmTitle':'Save changes', 'ap.confirmBody':'Save {n} change(s)?', 'confirm':'Confirm', 'nav.apList':'AP', 'nav.opExpense':'Operational Expense', 'nav.cogsTracking':'COGS Tracking', 'sv.skus':'Products', 'sv.units':'Units on hand', 'sv.atCost':'Value at cost', 'sv.atRetail':'Value at price', 'sv.potential':'Potential profit', 'sv.margin':'Margin', 'sv.byCat':'Value by category', 'sv.byOrigin':'Value by origin', 'sv.top':'Biggest holdings', 'sv.topHint':'Where most of the money is tied up (top 5)', 'sv.onHand':'On hand', 'sv.avgCost':'Cost/unit', 'sv.empty':'Nothing in stock', 'nav.stockValue':'Stock Valuation', 'cogs.pfee':'Platform fee', 'cogs.dfee':'Delivery fee', 'cogs.commission':'Commission', 'cogs.netProfit':'Profit after fees', 'comm.payout':'Payout model', 'comm.pool':'Split evenly', 'comm.person':'Per salesperson', 'comm.payoutHint':'Applies to employees with the Salesperson role type', 'comm.sellerCount':'Salespeople right now', 'comm.base':'Calculation base', 'comm.baseGoods':'Goods only', 'comm.baseGoodsShip':'Goods + shipping', 'comm.rates':'Rate per product category', 'comm.profitBase':'Calculated on PROFIT (revenue − cost − discounts − platform fee), not turnover · loss-making lines pay nothing', 'comm.ratesHint':'Defaults to 5% for every category', 'comm.noCats':'No product categories yet', 'cogs.top':'Top 10 products by profit', 'cogs.topHint':'Gross profit per product (bill-level platform/delivery/commission fees are excluded — they belong to the bill, not a product)', 'cogs.sold':'Sold (units)', 'cogs.perBill':'Per bill', 'cogs.bills':'Bills', 'cogs.revenue':'Revenue (excl. VAT)', 'cogs.total':'Total COGS', 'cogs.profit':'Gross profit', 'cogs.margin':'Margin', 'cogs.byCat':'Cost by product category', 'cogs.byOrigin':'Cost by origin', 'cogs.byStatus':'Cost: paid vs unpaid', 'cogs.paid':'Paid', 'cogs.unpaid':'Unpaid', 'cogs.short':'cost', 'cogs.barHint':'Cost sitting in unpaid bills = money already spent but not yet recovered', 'cogs.missing':'{n} line(s) have no cost lot selected — the cost shown may be understated', 'inv.byStatus':'By invoice status', 'inv.bills':'bills', 'inv.billed':'Total billed', 'inv.received':'Received so far', 'inv.unpaid':'Unpaid bills', 'inv.empty':'Nothing outstanding', 'nav.orderHistory':'Edit History', 'eh.record':'Record', 'eh.changes':'Changes', 'eh.lastAction':'Latest', 'eh.lastEdited':'Last edited', 'eh.when':'When', 'eh.by':'By', 'eh.action':'Action', 'eh.viewRaw':'View raw', 'eh.back':'Back', 'eh.empty':'No history yet', 'eh.rawTitle':'Snapshot (raw)', 'eh.create':'Created', 'eh.edit':'Edited', 'eh.delete':'Deleted', 'eh.imgChanges':'Image changes', 'eh.imgAdded':'Added', 'eh.imgRemoved':'Removed', 'eh.imgNoName':'(file name unknown)', 'eh.old':'Old', 'eh.new':'New', 'eh.viewDetail':'View detail', 'eh.items':'Items', 'eh.note':'Note', 'del.empty':'No deliveries yet', 'set.deliveryStatuses':'Delivery Statuses', 'set.shippingTypes':'Shipping Type', 'set.outsources':'Outsource providers', 'set.regionMode':'Region Grouping', 'nav.grouping':'Grouping', 'nav.shippingCost':'Shipping Cost', 'nav.deliveryList':'Delivery List', 'nav.deliveryBoard':'Delivery Status', 'nav.deliveryCalendar':'Calendar', 'nav.profile':'Organization', 'nav.profileGeneral':'General Stores', 'bp.titleGeneral':'General Stores (for documents)', 'bp.descGeneral':'Header for documents on bills WITHOUT the VAT tick — no tax ID.', 'bp.descOrg':'Header for documents on bills WITH the VAT tick (tax invoice).', 'cal.driverType':'Driver Type', 'cal.driver':'Driver', 'cal.allTypes':'All types', 'cal.allDrivers':'All drivers', 'cal.today':'Today', 'cal.unscheduled':'{n} unscheduled', 'cal.pickTitle':'Pick a delivery for this day', 'cal.pickNone':'No deliveries to pick yet', 'cal.pickAllAssigned':'Every delivery already has a date', 'cal.colorBy':'Color by', 'cal.byStatus':'Status', 'cal.byType':'Driver Type', 'cal.byDriver':'Driver', 'nav.deliveryDrivers':'Drivers', 'drv.title':'Driver colours', 'drv.desc':'Set a colour per driver — used in the calendar when colouring by driver', 'drv.our':'Our Driver', 'drv.outsource':'Outsource', 'drv.empty':'No drivers yet (add Delivery Driver employees or Outsources first)', 'set.shipCost':'Shipping Cost', 'set.shipCategory':'Product category', 'set.shipCostDesc':'Set shipping prices — by region (4/6) or per province', 'set.shipMode':'Pricing mode', 'set.shipByProvince':'Per province', 'set.shipProvSwitch':'Per-province method', 'set.shipException':'Region base + exceptions', 'set.shipManual':'Every province manually', 'set.shipPickRegion':'Pick a region (to set its provinces)', 'set.shipRegionBase':'Region base price', 'set.baht':'THB', 'set.region4':'4 regions', 'set.region6':'6 regions', 'set.regionModeHint':'How provinces group into regions — affects the Region column/filter in Delivery and the map colours (derived from province code, no duplicate data).',
+      'rev.invoiceNo': 'Invoice #', 'col.lastEdited':'Last edited', 'rev.customer': 'Recipient', 'rev.customerHint': 'Recipient full name', 'rev.back':'Back', 'rev.mapHint':'Or pick a province on the map', 'rev.selProvince':'Selected province', 'rev.noProvince':'No province selected', 'region.north':'North', 'region.central':'Central', 'region.northeast':'Northeast', 'region.east':'East', 'region.west':'West', 'region.south':'South', 'rev.address': 'Recipient address', 'rev.addressHint': 'Shipping address', 'rev.addrLine':'Address (no./soi/road)', 'rev.addrLineHint':'House no., moo, soi, road', 'rev.province':'Province', 'rev.district':'District', 'rev.subdistrict':'Subdistrict', 'rev.postal':'Postal code', 'rev.postalHint':'Auto', 'rev.loading':'Loading...', 'rev.errAddrLine':'Please enter the address line', 'rev.errAddrGeo':'Please select province/district/subdistrict', 'sec.seller':'Seller', 'sell.issuedBy':'Issued by', 'sell.signature':'Signature', 'sell.clear':'Clear', 'sell.upload':'Upload image', 'sell.signHint':'Draw in the box, or upload an image', 'sell.errSign':'Please sign before saving', 'sell.seller':'Seller', 'rev.platformFee':'Platform fee', 'rev.platform': 'Sold via Platform', 'rev.platformHint': 'e.g. TikTok Shop', 'sec.delivery':'Delivery', 'sec.inventory':'Inventory', 'rev.phone':'Phone', 'rev.phoneHint':'Contact phone', 'rev.shippingTitle':'Shipping', 'rev.shippingCost':'Shipping', 'rev.shippingOverride':'Override shipping (manual)', 'rev.shipAuto':'Auto', 'rev.shipNoCat':'No products/categories yet', 'sec.vat':'VAT Management', 'sec.payment':'Payment', 'pay.mode':'Payment Method', 'pay.paid':'Partially Paid', 'pay.vatable':'This bill is charged VAT 7% (added on top of the net)', 'pay.vat':'VAT', 'pay.vatSeparated':'Separated', 'pay.vatYes':'VAT 7%', 'pay.noProof':'No payment proof attached to this bill', 'pay.proof':'Payment proof', 'pay.proofHint':'Attach as many files as you need', 'pay.download':'Download', 'pay.pending':'Amount Pending', 'set.colTh':'Thai name (TH)', 'set.colEn':'English name (EN)', 'set.colFee':'Fee %', 'set.colColor':'Colour', 'set.expenseCategories':'Expense Categories', 'set.platforms':'Sales Platforms', 'set.feeHint':'Platform fee (%)', 'set.paymentModes':'Payment Methods', 'rev.discountsTitle':'Discounts', 'rev.itemDiscount':'Item Discount', 'rev.shippingDiscount':'Shipping Discount', 'rev.overallDiscount':'Overall Discount', 'rev.totalDiscount':'Total Discount', 'rev.deliveryMethod':'Delivery Method', 'rev.responsible':'Responsible', 'rev.pickResp':'— select —', 'rev.respHint':'Enter responsible', 'rev.proofLabel':'Delivery proof (Outsource)', 'rev.proofPick':'Attach file', 'rev.proofAttached':'Attached', 'rev.proofNone':'No file', 'rev.items': 'Items', 'del.allProvinces':'All provinces', 'del.allRegions':'All regions', 'del.allStatuses':'All statuses', 'del.orderNo':'Order #', 'del.recipient':'Recipient', 'del.province':'Province', 'del.region':'Region', 'del.address':'Address', 'del.status':'Delivery status', 'del.shipType':'Shipping Type', 'del.responsible':'Responsible', 'del.proof':'Proof', 'del.verified':'Verified', 'del.deliveryDate':'Delivery Date', 'nav.productHistory':'Edit History', 'nav.invoicing':'Invoicing', 'nav.arStatus':'AR Status', 'nav.receipts':'Receipts', 'rc.avg':'Average per receipt', 'inv.deposit':'Deposits received', 'rc.count':'Receipts', 'rc.total':'Total', 'rc.byMode':'By payment mode', 'rc.receipts':'receipts', 'rc.empty':'Nothing paid yet', 'se.delivery':'Actual delivery fee', 'se.other':'Other expenses', 'se.status':'Status', 'se.added':'Added', 'se.none':'No expense', 'se.addNote':'Add a note', 'nav.sellingExpenses':'Selling Expenses', 'ap.mass':'Mass settle', 'ap.massBody':'All {n} entries currently in view will be set to Paid + verified, and the attached files copied onto each of them · you still need to press Save', 'ap.paidAmount':'Paid amount', 'ap.mass':'Mark all as paid', 'ap.massBody':'All {n} row(s) currently shown ({amt} ฿) will be set to Paid and Verified', 'ap.massProofHint':'Any file added here is copied to every row (optional)', 'ox.updatedBy':'Updated by', 'nav.opexHistory':'Edit History', 'nav.finOverview':'Overview', 'nav.pnl':'Profit & Loss', 'nav.cashFlow':'Cash Flow', 'nav.taxReport':'Sales Tax', 'tax.modeVat':'VAT bills', 'tax.modeNoVat':'Non-VAT bills', 'tax.invoices':'Tax invoices', 'tax.billsNoVat':'Bills without VAT', 'tax.base':'Value before VAT', 'tax.output':'Output VAT (7%)', 'tax.grand':'Total incl. VAT', 'tax.byMonth':'Monthly summary (for filing)', 'tax.detail':'Tax invoice detail', 'tax.detailNoVat':'Bills excluded from the report', 'tax.issuer':'Issuer', 'tax.empty':'Nothing in this period', 'tax.hint':'Only bills ticked as VAT are pulled in · on a split bill the shipping sits outside the tax base · output VAT only, input VAT is not deducted', 'tax.hintNoVat':'These bills are NOT counted in the sales tax report — listed here so a missed VAT tick is easy to spot', 'cd.noteTitle':'Remark on documents', 'cd.noteHint':'This is the DEFAULT remark filled into the Remark box of every new bill — each bill can then be edited on its own, and documents print whatever that bill says', 'cd.notePh':'e.g. warranty terms, care instructions, contact channels', 'cd.saved':'Saved', 'cd.previewTitle':'How it will look', 'cd.previewHint':'It appears just above the signature area', 'cd.previewEmpty':'No remark yet', 'rev.remarkHint':'Prints on the document · starts from the Customer Document default, editable per bill', 'rev.noteHint':'Internal note — never printed', 'noAccess':'This role has no access to any tab on this page', 'cd.remark':'Remark', 'fin.allTime':'All time', 'fin.custom':'Custom range', 'fin.thisMonth':'This month', 'fin.netProfit':'Net profit', 'fin.cashIn':'Cash in', 'fin.cashOut':'Cash out', 'fin.cashNet':'Net cash', 'fin.ar':'Receivables', 'fin.ap':'Payables', 'fin.revByPlatform':'Revenue by channel', 'fin.revShort':'revenue', 'fin.costMix':'Where the money goes', 'fin.health':'Financial health', 'fin.healthHint':'Figures that always deserve a look — these ignore the period filter', 'fin.item':'Item', 'fin.count':'Count', 'fin.note':'Note', 'fin.hAr':'Bills not yet collected', 'fin.hArNote':'Chase these on the Invoicing page', 'fin.hAp':'Stock bills not yet paid', 'fin.hApNote':'Managed on the AP page', 'fin.hStock':'Stock value on hand', 'fin.hStockNote':'Cash tied up in goods', 'fin.hLoss':'Bills sold at a loss', 'fin.hLossNote':'Check them in COGS Tracking', 'fin.hVat':'VAT collected from customers', 'fin.hVatNote':'Not your revenue', 'fin.statement':'Profit & loss statement', 'fin.ofRevenue':'% of revenue', 'fin.revenue':'Sales revenue', 'fin.sellingExp':'Selling expenses', 'fin.afterSelling':'Profit after selling costs', 'fin.noOpex':'No operating expenses in this period', 'fin.revTrend':'Revenue, last 6 months', 'fin.netTrend':'Net profit, last 6 months', 'fin.trendHint':'Revenue growing while profit does not usually means costs are eating the margin', 'fin.byMonth':'Month by month', 'fin.month':'Month', 'fin.movement':'Movement', 'fin.party':'Party', 'fin.in':'In', 'fin.out':'Out', 'fin.mCustomer':'From customer', 'fin.mSupplier':'To supplier', 'fin.noMoves':'No money moved in this period', 'fin.inTrend':'Cash in by month', 'fin.outTrend':'Cash out by month', 'fin.cashHint':'Cash differs from profit — a sale you have not been paid for brings in nothing', 'fin.vsProfit':'Cash vs profit', 'ox.payrollOf':'Payroll \u2014 {m}', 'ox.autoRow':'Posted automatically when the payroll month was authorized — not editable here', 'ox.category':'Category', 'ox.details':'Details', 'ox.amount':'Amount', 'ox.receipt':'Receipt', 'ox.add':'+ Add entry', 'ox.addTitle':'Record a new expense', 'ox.addHint':'Fill in and press Enter · rows can be edited in the table and save instantly', 'ox.descPh':'What was it for?', 'ox.count':'Entries', 'ox.total':'Total spent', 'ox.avg':'Average per entry', 'ox.biggest':'Biggest category', 'ox.byCat':'Spending by category', 'ox.short':'spent', 'ox.empty':'Nothing recorded yet', 'ox.errAmount':'Please enter an amount', 'ox.delConfirm':'Delete this entry?', 'ap.status':'AP Status', 'ap.unpaid':'Unpaid', 'ap.partial':'Partially Paid', 'ap.paid':'Paid', 'ap.proof':'Payment proof', 'ap.amount':'Amount', 'ap.entries':'Stock-in entries', 'ap.total':'Total value', 'ap.owed':'Still owed', 'ap.settled':'Settled', 'ap.empty':'No stock-in yet', 'ap.clickHint':'Click to change', 'ap.unsaved':'Unsaved changes', 'ap.confirmTitle':'Save changes', 'ap.confirmBody':'Save {n} change(s)?', 'confirm':'Confirm', 'nav.apList':'AP', 'nav.opExpense':'Operational Expense', 'nav.cogsTracking':'COGS Tracking', 'sv.skus':'Products', 'sv.units':'Units on hand', 'sv.atCost':'Value at cost', 'sv.atRetail':'Value at price', 'sv.potential':'Potential profit', 'sv.margin':'Margin', 'sv.byCat':'Value by category', 'sv.byOrigin':'Value by origin', 'sv.top':'Biggest holdings', 'sv.topHint':'Where most of the money is tied up (top 5)', 'sv.onHand':'On hand', 'sv.avgCost':'Cost/unit', 'sv.empty':'Nothing in stock', 'nav.stockValue':'Stock Valuation', 'cogs.pfee':'Platform fee', 'cogs.dfee':'Delivery fee', 'cogs.commission':'Commission', 'cogs.netProfit':'Profit after fees', 'comm.payout':'Payout model', 'comm.pool':'Split evenly', 'comm.person':'Per salesperson', 'comm.payoutHint':'Applies to employees with the Salesperson role type', 'comm.sellerCount':'Salespeople right now', 'comm.base':'Calculation base', 'comm.baseGoods':'Goods only', 'comm.baseGoodsShip':'Goods + shipping', 'comm.rates':'Rate per product category', 'comm.profitBase':'Calculated on PROFIT (revenue − cost − discounts − platform fee), not turnover · loss-making lines pay nothing', 'comm.ratesHint':'Defaults to 5% for every category', 'comm.noCats':'No product categories yet', 'cogs.top':'Top 10 products by profit', 'cogs.topHint':'Gross profit per product (bill-level platform/delivery/commission fees are excluded — they belong to the bill, not a product)', 'cogs.sold':'Sold (units)', 'cogs.perBill':'Per bill', 'cogs.bills':'Bills', 'cogs.revenue':'Revenue (excl. VAT)', 'cogs.total':'Total COGS', 'cogs.profit':'Gross profit', 'cogs.margin':'Margin', 'cogs.byCat':'Cost by product category', 'cogs.byOrigin':'Cost by origin', 'cogs.byStatus':'Cost: paid vs unpaid', 'cogs.paid':'Paid', 'cogs.unpaid':'Unpaid', 'cogs.short':'cost', 'cogs.barHint':'Cost sitting in unpaid bills = money already spent but not yet recovered', 'cogs.missing':'{n} line(s) have no cost lot selected — the cost shown may be understated', 'inv.byStatus':'By invoice status', 'inv.bills':'bills', 'inv.billed':'Total billed', 'inv.received':'Received so far', 'inv.unpaid':'Unpaid bills', 'inv.empty':'Nothing outstanding', 'nav.orderHistory':'Edit History', 'eh.record':'Record', 'eh.changes':'Changes', 'eh.lastAction':'Latest', 'eh.lastEdited':'Last edited', 'eh.when':'When', 'eh.by':'By', 'eh.action':'Action', 'eh.viewRaw':'View raw', 'eh.back':'Back', 'eh.empty':'No history yet', 'eh.rawTitle':'Snapshot (raw)', 'eh.create':'Created', 'eh.edit':'Edited', 'eh.delete':'Deleted', 'eh.imgChanges':'Image changes', 'eh.imgAdded':'Added', 'eh.imgRemoved':'Removed', 'eh.imgNoName':'(file name unknown)', 'eh.old':'Old', 'eh.new':'New', 'eh.viewDetail':'View detail', 'eh.items':'Items', 'eh.note':'Note', 'del.empty':'No deliveries yet', 'set.deliveryStatuses':'Delivery Statuses', 'set.shippingTypes':'Shipping Type', 'set.outsources':'Outsource providers', 'set.regionMode':'Region Grouping', 'nav.grouping':'Grouping', 'nav.shippingCost':'Shipping Cost', 'nav.deliveryList':'Delivery List', 'nav.deliveryBoard':'Delivery Status', 'nav.deliveryCalendar':'Calendar', 'nav.profile':'Organization', 'nav.profileGeneral':'General Stores', 'bp.titleGeneral':'General Stores (for documents)', 'bp.descGeneral':'Header for documents on bills WITHOUT the VAT tick — no tax ID.', 'bp.descOrg':'Header for documents on bills WITH the VAT tick (tax invoice).', 'cal.driverType':'Driver Type', 'cal.driver':'Driver', 'cal.allTypes':'All types', 'cal.allDrivers':'All drivers', 'cal.today':'Today', 'cal.unscheduled':'{n} unscheduled', 'cal.pickTitle':'Pick a delivery for this day', 'cal.pickNone':'No deliveries to pick yet', 'cal.pickAllAssigned':'Every delivery already has a date', 'cal.colorBy':'Color by', 'cal.byStatus':'Status', 'cal.byType':'Driver Type', 'cal.byDriver':'Driver', 'nav.deliveryDrivers':'Drivers', 'drv.title':'Driver colours', 'drv.desc':'Set a colour per driver — used in the calendar when colouring by driver', 'drv.our':'Our Driver', 'drv.outsource':'Outsource', 'drv.empty':'No drivers yet (add Delivery Driver employees or Outsources first)', 'set.shipCost':'Shipping Cost', 'set.shipCategory':'Product category', 'set.shipCostDesc':'Set shipping prices — by region (4/6) or per province', 'set.shipMode':'Pricing mode', 'set.shipByProvince':'Per province', 'set.shipProvSwitch':'Per-province method', 'set.shipException':'Region base + exceptions', 'set.shipManual':'Every province manually', 'set.shipPickRegion':'Pick a region (to set its provinces)', 'set.shipRegionBase':'Region base price', 'set.baht':'THB', 'set.region4':'4 regions', 'set.region6':'6 regions', 'set.regionModeHint':'How provinces group into regions — affects the Region column/filter in Delivery and the map colours (derived from province code, no duplicate data).',
       'rev.orderStatus': 'Order Status', 'rev.invoiceStatus': 'Invoice Status', 'rev.totalRows': 'Total',
       'rev.empty': 'No orders yet — add your first order', 'rev.delConfirm': 'Delete this order?',
-      'rev.addItem': '+ Add item', 'rev.itemName': 'Product name', 'rev.itemProduct': 'Product', 'rev.itemQty': 'Qty', 'rev.itemDisc': 'Disc', 'rev.itemNet': 'Net', 'rev.itemPrice': 'Price', 'rev.itemsTotal': 'Items total',
+      'pp.title':'Select product', 'pp.searchPh':'Search by product name or SKU…', 'pp.repair':'Repair charge', 'pp.repairHint':'For repair/service charges that are not stock items — type the details and price yourself (no stock deducted, no cost).', 'pp.repairDesc':'Repair details', 'pp.repairDescPh':'e.g. replace front brake cable + labour', 'pp.repairPrice':'Price (THB)', 'pp.repairAdd':'Add repair charge', 'pp.errRepairDesc':'Please enter the repair details', 'pp.noMatch':'No products match your search', 'pp.count':'{n} items', 'pp.change':'Click to change', 'rev.addItem': '+ Add item', 'rev.itemName': 'Product name', 'rev.itemProduct': 'Product', 'rev.itemQty': 'Qty', 'rev.itemDisc': 'Disc', 'rev.itemNet': 'Net', 'rev.itemPrice': 'Price', 'rev.itemsTotal': 'Items total',
       'rev.errCustomer': 'Please enter recipient name', 'rev.errAddress': 'Please enter recipient address', 'rev.errItems': 'Please add at least one item', 'rev.errPickProduct': 'Please pick products from the list only', 'rev.pickProduct': '— Select product —', 'rev.noProducts': 'No products yet — please add products first in the Products page',
       'prod.pinTitle': 'This page needs a PIN', 'prod.pinDesc': 'Enter your 6-digit PIN to manage products', 'prod.pinWrong': 'Wrong PIN, please try again', 'prod.pinClear': 'Clear',
       'prod.restock': '+ Restock', 'prod.add': '+ Add product',
@@ -5665,7 +5903,7 @@
       'promo.noProdInCat': 'No products in this category', 'promo.delConfirm': 'Delete this promotion?',
       'promo.errDates': 'Please set both start and end dates', 'promo.errRange': 'End date cannot be before start date', 'promo.errItems': 'Please pick at least one product',
       'promo.endedTitle': 'Promotion ended', 'promo.endedOn': 'ended',
-      'prod.stock': 'Stock', 'prod.origin':'Cost Origin (opening)', 'prod.noLots':'No lots yet', 'prod.unit':'pcs', 'prod.reserved': 'Reserved', 'prod.sold': 'Sold', 'prod.ptype': 'Category', 'prod.pickType': '— Select category —', 'prod.errType': 'Please select a category', 'prod.tag': 'Status', 'prod.empty': 'No products yet — add your first one',
+      'prod.stock': 'Stock', 'prod.allCats':'All Products', 'prod.noCat':'No category', 'prod.showing':'Showing {a}–{b} of {n}', 'prod.origin':'Cost Origin (opening)', 'prod.noLots':'No lots yet', 'prod.unit':'pcs', 'prod.reserved': 'Reserved', 'prod.sold': 'Sold', 'prod.ptype': 'Category', 'prod.pickType': '— Select category —', 'prod.errType': 'Please select a category', 'prod.tag': 'Status', 'prod.empty': 'No products yet — add your first one',
       'prod.delConfirm': 'Delete this product? (past orders keep their name/price)', 'prod.errSku': 'Please enter a SKU', 'prod.errName': 'Please enter a product name', 'exp.errDetails': 'Please enter item details', 'exp.errDate': 'Please pick a date', 'exp.errAmount': 'Quantity must be greater than 0',
       'nav.expense': 'Expenses', 'nav.summary': 'Cost Summary', 'nav.revenue': 'Revenue / Billing',
       'nav.orderStatus': 'Order Status', 'nav.invoiceStatus': 'Invoice Status',

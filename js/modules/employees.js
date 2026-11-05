@@ -48,8 +48,7 @@
         { id:'deliveryStatus', label:{ th:'สถานะ', en:'Status' } },
         { id:'deliveryCal',    label:{ th:'ปฏิทิน', en:'Calendar' } },
         { id:'deliveryDrivers',label:{ th:'คนขับ', en:'Drivers' } }
-      ]},
-      { id:'storefront', label:{ th:'หน้าร้าน', en:'Storefront' } }
+      ]}
     ]},
     { key:'accounting', label:{ th:'บัญชี', en:'Accounting' }, items:[
       { id:'revenueAcct', label:{ th:'รายได้ & บัญชี', en:'Revenue & Accounting' }, subs:[
@@ -94,7 +93,6 @@
         { id:'ieStock',     label:{ th:'จัดการสต๊อก', en:'Stock' } },
         { id:'ieSell',      label:{ th:'การขาย', en:'Sell' } },
         { id:'ieDelivery',  label:{ th:'การจัดส่ง', en:'Delivery' } },
-        { id:'ieStorefront',label:{ th:'หน้าร้าน', en:'Storefront' } },
         { id:'ieRevenue',   label:{ th:'รายได้ & บัญชี', en:'Revenue & Accounting' } },
         { id:'ieCogs',      label:{ th:'ต้นทุนขาย', en:'COGS' } },
         { id:'ieExpense',   label:{ th:'รายจ่าย & เจ้าหนี้', en:'Expense & Payable' } },
@@ -500,6 +498,7 @@
     navLabel: { th:'พนักงาน', en:'Employees' },
     pageId: 'page-employeeMgmt',
     async onInit(){ await loadAll(); },
+    async onRemoteChange(){ await loadAll(); },   // live sync: re-read from the updated cache
     mount(container){
       container.innerHTML = `
         <div class="topbar">
@@ -535,6 +534,7 @@
     navLabel: { th:'บทบาท & สิทธิ์', en:'Roles & Access' },
     pageId: 'page-rolesAccess',
     async onInit(){ await loadAll(); },
+    async onRemoteChange(){ await loadAll(); },   // live sync: re-read from the updated cache
     mount(container){
       container.innerHTML = `
         <div class="topbar">

@@ -820,7 +820,7 @@ function renderInterfacePage(){
   renderModuleDataTools();
   if(STORE_ONLY){
     // Store-only: the kanban card CSV/JSON panel is hidden — only the module
-    // backup boxes (Simple Store, Storefront) are shown.
+    // backup boxes are shown.
     const kp = document.getElementById('ifKanbanPanel');
     if(kp) kp.style.display = 'none';
     const crumb = document.querySelector('#page-interface .crumb');
